@@ -1,11 +1,16 @@
 FROM debian:bullseye-slim
 
 # Setup 32-bit architecture for AoM (which is a 32-bit app)
-RUN dpkg --add-architecture i386 && apt-get update && \
+RUN dpkg --add-architecture i386 && \
+    sed -i 's/main/main contrib non-free/g' /etc/apt/sources.list && \
+    apt-get update && \
     apt-get install -y --no-install-recommends \
     wine wine32 libwine:i386 \
-    xvfb xdotool winetricks cabextract tini procps \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+    xvfb xauth xdotool cabextract tini procps curl wget ca-certificates \
+    && curl -fL https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks \
+       -o /usr/local/bin/winetricks && \
+    chmod +x /usr/local/bin/winetricks && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Environment variables for headless Wine
 ENV WINEARCH=win32
