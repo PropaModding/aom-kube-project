@@ -7,7 +7,7 @@ RUN dpkg --add-architecture i386 && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
     wine wine32 libwine libgl1-mesa-dri:i386 libgl1-mesa-glx:i386 mesa-utils:i386 \
-    xvfb xauth xdotool imagemagick scrot x11-utils cabextract tini procps curl wget \
+    xvfb xauth xdotool imagemagick scrot x11-utils x11vnc cabextract tini procps curl wget \
     xfonts-base xfonts-100dpi xfonts-75dpi ca-certificates \
     # FIX: Use the complete RAW URL for the Winetricks script
     && curl -fL https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks -o /usr/local/bin/winetricks \
@@ -23,6 +23,7 @@ ENV WINEARCH=win32
 ENV WINEPREFIX=/home/aomuser/.wine
 ENV DISPLAY=:99
 ENV WINEDEBUG=-all
+ENV WINEDLLOVERRIDES="mscoree,mshtml="
 
 RUN useradd -m aomuser && \
     groupadd -f video && groupadd -f render && \
@@ -35,7 +36,6 @@ WORKDIR /home/aomuser
 # Using ; instead of && to ensure non-critical Wine warnings don't break the build
 RUN Xvfb :99 -screen 0 800x600x16 -ac -nolisten unix & \
     sleep 5 ; \
-    export WINEDLLOVERRIDES="mscoree,mshtml=" ; \
     wineboot --init ; wineserver -w ; \
     # FIX: EULA & PID for THE TITANS EXPANSION specifically
     wine reg add "HKEY_CURRENT_USER\Software\Ensemble Studios\Age of Mythology Expansion\1.0" /v "EULA" /t REG_DWORD /d "1" /f ; \
@@ -57,6 +57,10 @@ RUN Xvfb :99 -screen 0 800x600x16 -ac -nolisten unix & \
     sleep 5 ; wineserver -k || true
 
 # 4. Finalise Files & Configuration
+COPY --chown=aomuser:aomuser ./entrypoint.sh /home/aomuser/entrypoint.sh
+COPY --chown=aomuser:aomuser ./host-game.sh /home/aomuser/host-game.sh
+RUN chmod +x /home/aomuser/entrypoint.sh /home/aomuser/host-game.sh
+
 COPY --chown=aomuser:aomuser ./aom_files /home/aomuser/aom
 WORKDIR /home/aomuser/aom
 
@@ -71,7 +75,8 @@ RUN mkdir -p /home/aomuser/aom/startup && \
     echo "noSound" >> /home/aomuser/aom/startup/user.cfg && \
     echo "overrideResolution" >> /home/aomuser/aom/startup/user.cfg
 
-ENTRYPOINT ["tini", "--"]
-# Starting a shell so you can manually run or automate from here
+ENTRYPOINT ["tini", "--", "/home/aomuser/entrypoint.sh"]
+# Starting a shell so you can manually run or automate from here; override with
+# e.g. `wine aomxnocd1.exe xres=800 yres=600 NoIntroCinematics` to launch the game
 CMD ["/bin/bash"]
 
