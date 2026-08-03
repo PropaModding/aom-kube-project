@@ -19,6 +19,14 @@ spec:
       labels:
         app: aom-headless
     spec:
+      # Host network so DirectPlay8's fixed ports (2299/2300) are reachable
+      # straight on the minikube node's own IP — AoM's Direct Connect field
+      # has no port entry, so a NodePort remap (which lands outside
+      # 2299/2300 by default) wouldn't work without a proxy in front of it.
+      # Only put one pod on hostNetwork per node: a second hostNetwork pod
+      # on the same node would collide on these same ports.
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
       containers:
         - name: aom
           image: aom-k8s:latest
