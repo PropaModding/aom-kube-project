@@ -1,0 +1,53 @@
+FROM debian:bullseye-slim
+
+# 1. Add 32-bit architecture & Repo fixes
+RUN dpkg --add-architecture i386 && \
+    echo "deb [check-valid-until=no] http://archive.debian.org/debian bullseye-backports main" > /etc/apt/sources.list.d/backports.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    wine \
+    wine32 \
+    libwine \
+    libgl1-mesa-dri:i386 \
+    libgl1-mesa-glx:i386 \
+    mesa-utils:i386 \
+    xvfb xauth xdotool imagemagick scrot x11-utils cabextract tini procps curl wget xfonts-base xfonts-100dpi xfonts-75dpi ca-certificates \
+    # FIX: Updated URL to the explicit RAW source to prevent "Syntax error: newline unexpected"
+    && curl -fL https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks -o /usr/local/bin/winetricks \
+    && chmod +x /usr/local/bin/winetricks \
+    # Validation: Ensures the downloaded file is actually a shell script and not a 404 page
+    && head -n 1 /usr/local/bin/winetricks | grep -q "#!" \
+    && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+ENV WINEARCH=win32
+ENV WINEPREFIX=/home/aomuser/.wine
+ENV DISPLAY=:99
+ENV WINEDEBUG=-all,err+all
+
+RUN useradd -m aomuser && \
+    groupadd -f video && groupadd -f render && \
+    usermod -aG video,render aomuser
+
+USER aomuser
+WORKDIR /home/aomuser
+
+# 2. Sequential Prefix Setup
+# Using -ac to bypass any remaining Xauth permission issues
+RUN Xvfb :99 -screen 0 1024x768x16 -ac -nolisten unix & \
+    sleep 5 && \
+    export WINEDLLOVERRIDES="mscoree,mshtml=" && \
+    wineboot --init && wineserver -w && \
+    /usr/local/bin/winetricks -q directplay && wineserver -w && \
+    /usr/local/bin/winetricks -q msxml4 mfc42 d3dx9 && wineserver -w && \
+    rm -rf /home/aomuser/.cache/winetricks/vcrun2015 && \
+    /usr/local/bin/winetricks -q vcrun2015 && wineserver -w && \
+    wine reg add "HKEY_CURRENT_USER\Software\Wine\Direct3D" /v "VideoMemorySize" /t REG_SZ /d "128" /f && \
+    wineserver -k
+
+COPY --chown=aomuser:aomuser ./aom_files /home/aomuser/aom
+WORKDIR /home/aomuser/aom
+
+ENTRYPOINT ["tini", "--"]
+CMD ["/bin/bash"]
+

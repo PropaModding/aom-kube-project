@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 1. Configuration
-IMAGE_NAME="aom-head"
+IMAGE_NAME="aom-test"
 HOST_XAUTH="/tmp/.docker.xauth"
 
 # 2. Prepare X11 Authentication
@@ -15,7 +15,7 @@ echo "Starting Age of Mythology: Titans (No-CD) in Container..."
 
 # 3. Launch the Container
 # Changed the final command to launch aomxnocd1.exe
-docker run -t --rm \
+docker run -it --rm \
     --net=host \
     --device /dev/dri:/dev/dri \
     --group-add video \

@@ -1,8 +1,17 @@
 #!/bin/bash
+# Second AoM instance, meant to run alongside run-aom-head.sh so you can host
+# in one window and browse/join LAN games from the other. DirectPlay8's LAN
+# discovery is query/response: a lone host never transmits anything until a
+# client broadcasts an "enumerate hosts" query, so this client is what
+# actually makes the host's DirectPlay8 traffic happen.
+#
+# Uses its own Xauth file and container name so it can run at the same time
+# as run-aom-head.sh without the two stepping on each other's cleanup.
 
 # 1. Configuration
 IMAGE_NAME="aom-head"
-HOST_XAUTH="/tmp/.docker.xauth"
+CONTAINER_NAME="aom-client"
+HOST_XAUTH="/tmp/.docker.xauth.client"
 
 # 2. Prepare X11 Authentication
 rm -f $HOST_XAUTH
@@ -11,11 +20,11 @@ xauth nlist $DISPLAY | sed -e 's/^..../ffff/' | xauth -f $HOST_XAUTH nmerge -
 chmod 644 $HOST_XAUTH
 xhost +local:docker > /dev/null
 
-echo "Starting Age of Mythology: Titans (No-CD) in Container..."
+echo "Starting Age of Mythology: Titans (No-CD) client instance..."
 
 # 3. Launch the Container
-# Changed the final command to launch aomxnocd1.exe
 docker run -t --rm \
+    --name "$CONTAINER_NAME" \
     --net=host \
     --device /dev/dri:/dev/dri \
     --group-add video \
@@ -35,4 +44,3 @@ docker run -t --rm \
 echo "Cleaning up permissions..."
 xhost -local:docker > /dev/null
 rm -f $HOST_XAUTH
-

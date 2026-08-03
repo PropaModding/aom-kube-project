@@ -1,0 +1,62 @@
+FROM debian:bullseye-slim
+
+# Headless AoM image meant to run as a Kubernetes pod with no host
+# passthrough at all: no /dev/dri, no host X11 socket, no PulseAudio.
+# Software rendering only (LIBGL_ALWAYS_SOFTWARE) since cloud node pools
+# (AKS included) don't have a GPU device to pass through. Xvfb + optional
+# VNC are self-contained via entrypoint.sh, so a Deployment just overrides
+# the command to launch the game directly.
+
+# 1. SYSTEM SETUP
+RUN dpkg --add-architecture i386 && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+    wine wine32 libwine libgl1-mesa-dri:i386 libgl1-mesa-glx:i386 mesa-utils:i386 \
+    xvfb xauth xdotool x11-utils x11vnc tini procps cabextract curl wget ca-certificates \
+    xfonts-base xfonts-100dpi xfonts-75dpi \
+    && curl -fL https://raw.githubusercontent.com/Winetricks/winetricks/master/src/winetricks -o /usr/local/bin/winetricks \
+    && chmod +x /usr/local/bin/winetricks \
+    && head -n 1 /usr/local/bin/winetricks | grep -q "#!" \
+    && mkdir -p /tmp/.X11-unix && chmod 1777 /tmp/.X11-unix \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# 2. ENVIRONMENT
+ENV WINEARCH=win32
+ENV WINEPREFIX=/home/aomuser/.wine
+ENV DISPLAY=:99
+ENV LIBGL_ALWAYS_SOFTWARE=1
+
+RUN groupadd -f video && groupadd -f render && \
+    useradd -m aomuser && usermod -aG video,render aomuser
+
+USER aomuser
+WORKDIR /home/aomuser
+
+# 3. WINE CONFIGURATION (software rendering, no audio, no GPU detection)
+RUN Xvfb :99 -screen 0 800x600x16 -ac -nolisten unix & \
+    sleep 5 ; \
+    export WINEDLLOVERRIDES="mscoree,mshtml=" ; \
+    wineboot --init ; wineserver -w ; \
+    wine reg add "HKEY_CURRENT_USER\Software\Ensemble Studios\Age of Mythology Expansion\1.0" /v "EULA" /t REG_DWORD /d "1" /f ; \
+    wine reg add "HKEY_CURRENT_USER\Software\Ensemble Studios\Age of Mythology Expansion\1.0" /v "PID" /t REG_SZ /d "11111-11111-11111-11111-11111" /f ; \
+    wine reg add "HKEY_CURRENT_USER\Software\Wine\Direct3D" /v "VideoPciVendorID" /t REG_DWORD /d "0x10de" /f ; \
+    wine reg add "HKEY_CURRENT_USER\Software\Wine\Direct3D" /v "VideoPciDeviceID" /t REG_DWORD /d "0x0402" /f ; \
+    wine reg add "HKEY_CURRENT_USER\Software\Wine\Drivers" /v "Audio" /t REG_SZ /d "null" /f ; \
+    wine reg add "HKEY_CURRENT_USER\Software\Wine\X11 Driver" /v "Desktop" /t REG_SZ /d "800x600" /f ; \
+    /usr/local/bin/winetricks -q directplay msxml4 d3dx9 mfc42 ; wineserver -w ; \
+    sleep 2 ; wineserver -k || true
+
+# 4. Finalise files & config
+COPY --chown=aomuser:aomuser ./entrypoint.sh /home/aomuser/entrypoint.sh
+RUN chmod +x /home/aomuser/entrypoint.sh
+
+COPY --chown=aomuser:aomuser ./aom_files /home/aomuser/aom
+WORKDIR /home/aomuser/aom
+
+RUN mkdir -p /home/aomuser/aom/startup && \
+    printf "xres=800\nyres=600\nnoIntroCinematics\nskipIntro\nnoVideo\nwindow\nnoSound\nlowDetail\noverrideResolution\nignoreSyncCheck\n" > /home/aomuser/aom/startup/user.cfg
+
+ENTRYPOINT ["tini", "--", "/home/aomuser/entrypoint.sh"]
+# Overridden by the Deployment's command/args to launch the actual game,
+# e.g. `wine aomxnocd1.exe xres=800 yres=600 NoIntroCinematics`
+CMD ["/bin/bash"]

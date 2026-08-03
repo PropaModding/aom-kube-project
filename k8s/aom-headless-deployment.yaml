@@ -1,0 +1,53 @@
+# Headless AoM pod: no /dev/dri, no host X11, no PulseAudio. Xvfb + optional
+# VNC are self-contained (see dockerfile.k8s + entrypoint.sh); this is what
+# validates the image will actually run on a GPU-less cloud node pool (AKS
+# included) rather than quietly depending on hardware only present on a dev
+# box.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aom-headless
+  labels:
+    app: aom-headless
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: aom-headless
+  template:
+    metadata:
+      labels:
+        app: aom-headless
+    spec:
+      containers:
+        - name: aom
+          image: aom-k8s:latest
+          imagePullPolicy: Never # image is loaded straight into the node, not pulled from a registry
+          command: ["wine"]
+          args: ["aomxnocd1.exe", "xres=800", "yres=600", "NoIntroCinematics"]
+          env:
+            - name: ENABLE_VNC
+              value: "1"
+          ports:
+            - name: vnc
+              containerPort: 5900
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: aom-headless-vnc
+spec:
+  selector:
+    app: aom-headless
+  ports:
+    - name: vnc
+      port: 5900
+      targetPort: 5900
+  type: ClusterIP
