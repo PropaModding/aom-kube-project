@@ -1,23 +1,24 @@
-# Headless AoM pod: no /dev/dri, no host X11, no PulseAudio. Xvfb + optional
-# VNC are self-contained (see dockerfile.k8s + entrypoint.sh); this is what
-# validates the image will actually run on a GPU-less cloud node pool (AKS
-# included) rather than quietly depending on hardware only present on a dev
-# box.
+# Second AoM pod, meant to run alongside aom-headless so the two can be
+# used the same way run-aom-head.sh + run-aom-client.sh were on a single
+# Docker host: one hosts, the other joins/browses so DirectPlay8 discovery
+# traffic actually gets generated (a lone host never transmits anything on
+# its own, see docs/directplay8-protocol.md). Same image as the host pod —
+# only the launch args and labels differ.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: aom-headless
+  name: aom-client
   labels:
-    app: aom-headless
+    app: aom-client
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: aom-headless
+      app: aom-client
   template:
     metadata:
       labels:
-        app: aom-headless
+        app: aom-client
     spec:
       containers:
         - name: aom
@@ -27,7 +28,7 @@ spec:
           # image's ENTRYPOINT (tini -- entrypoint.sh, which starts Xvfb)
           # rather than just its CMD, and wine would launch with no X
           # server to talk to. `args` alone overrides CMD only.
-          args: ["wine", "aomxnocd1.exe", "xres=800", "yres=600", "NoIntroCinematics", "window"]
+          args: ["wine", "aomxnocd1.exe", "xres=1024", "yres=768", "NoIntroCinematics"]
           env:
             - name: ENABLE_VNC
               value: "1"
@@ -45,10 +46,10 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: aom-headless-vnc
+  name: aom-client-vnc
 spec:
   selector:
-    app: aom-headless
+    app: aom-client
   ports:
     - name: vnc
       port: 5900

@@ -107,18 +107,64 @@ listed entry, independent of the broadcast enumeration.
   is the cheapest thing to switch on when writing a packet filter/rewriter.
 - The `sin_zero` bytes are unexplained — don't assume they're safe to zero
   out or ignore until we understand what varies them.
-- Actual gameplay traffic on UDP 2300 hasn't been captured yet — this
-  capture only covers the LAN discovery phase, not what happens once a
-  client actually connects and plays. That's the natural next capture to
-  run.
+
+## Direct IP Connect (in-cluster capture, 2026-08-03)
+
+AoM's "LAN/Direct IP" screen has a second entry point besides browsing: a
+"Type a Direct IP" field + Connect button. Captured by hosting from one k8s
+pod (`aom-headless`, 10.244.0.16) and Direct-Connecting from another
+(`aom-client`, 10.244.0.14) over the pod network — no real LAN/broadcast
+domain involved. Source: `archiving/sessions/20260803-direct-connect-k8s/session.pcap`.
+
+**Confirms Direct Connect reuses the exact same 0x25/0x26 messages as LAN
+discovery, just unicast instead of broadcast**, from a fresh ephemeral port
+(distinct from whatever port the client's background LAN-browse query was
+using):
+
+1. Client sends the identical 9-byte `0x25` query, but straight to the
+   typed IP on port 2299 instead of `255.255.255.255`.
+2. Host replies with the identical 67-byte `0x26` format — same double
+   `sockaddr_in`, same length-prefixed UTF-16LE name (`"Host's Game"`
+   round-tripped exactly) — confirming this is one shared code path with
+   LAN browsing, not a separate protocol.
+3. Once confirmed reachable, a 41-byte packet (matching the earlier
+   0x20/0x21 ping shape) fires once, then traffic moves to UDP 2300.
+
+**UDP 2300 session traffic, captured for the first time.** This is real
+session/connection-establishment protocol, only partially decoded so far:
+
+- First exchange: both sides send a 40-byte packet containing an 8-byte
+  header followed by *two* back-to-back `sockaddr_in` blocks — one for the
+  host's own address, one for the peer's — effectively "here's me, here's
+  you" pairing. The host's version repeats 2-3 times before the client
+  answers with its own (self/peer order flipped).
+- Bytes 4-5 of subsequent 2300 packets carry a constant 2-byte value
+  (`ef 35` in this capture) that stays fixed across dozens of packets in
+  the same session — looks like a per-session connection ID.
+- After the handshake, a steady stream of small packets (19-51 bytes)
+  follows a `03 00 <seq> <seq> ef 35 ...` shape, where a 2-byte value
+  increments by one for every packet pair (`27 27`, `28 28`, `29 29`, ...)
+  — looks like a sequence-numbered reliable-delivery layer riding on top
+  of raw UDP, doubled for some reason (possibly send/ack pairing).
+- One of the client's very first 2300 packets contained what look like
+  raw process pointers (e.g. `e9 7f a6 00` decodes as a plausible 32-bit
+  stack/heap address) — possibly uninitialized memory leaking onto the
+  wire, a known class of bug in games this old. Not yet confirmed.
+
+None of this is fully decoded yet — flagging the shapes above as a
+starting point for whoever picks this back up, not a finished spec.
 
 ## Open questions
 
-- What are the 8 non-zero `sin_zero` bytes? They differ slightly between
-  the discovery reply and the ping reply from the same host — possibly a
-  sequence number, session token, or uninitialized memory from Wine's
-  `dpnet` implementation (worth checking Wine source/debug logs for).
+- What are the 8 non-zero `sin_zero` bytes? Possibly a sequence number,
+  session token, or uninitialized memory from Wine's `dpnet`
+  implementation (worth checking Wine source/debug logs for). Note: in
+  the 2026-08-03 capture the same exact 8 bytes appeared for *both* the
+  host's and client's `sockaddr_in` within one session, which fits
+  "uninitialized/reused buffer" better than "per-address token."
 - What's inside the 0x26 header's `00 00` (bytes 2-3, before the trailing
   `00` at byte 4) — likely a version or reserved field, unconfirmed.
-- What does actual session traffic on UDP 2300 look like once a client
-  joins and plays?
+- Full structure of the UDP 2300 session/sequence-numbering layer (see
+  above) — what the two incrementing counters actually track, what the
+  8-byte header before each sockaddr pair means, and whether the apparent
+  pointer leak is real or a misread.

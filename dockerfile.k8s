@@ -33,17 +33,27 @@ USER aomuser
 WORKDIR /home/aomuser
 
 # 3. WINE CONFIGURATION (software rendering, no audio, no GPU detection)
+# GPU spoof is Intel 0x8086/0x2562 (i845), not an arbitrary "modern" ID —
+# the game validates vendor/device IDs against its own bundled compat
+# tables in aom_files/gfxconfig/, and i845.gfx is the one profile built
+# for software-only rendering (no hardwareTNL). See
+# docs/headless-gpu-compat.md for the full investigation; a GPU ID that
+# isn't in those tables causes a silent "Initialization Failed" with no
+# Wine-level error, since it's the game's own logic rejecting it.
 RUN Xvfb :99 -screen 0 800x600x16 -ac -nolisten unix & \
     sleep 5 ; \
     export WINEDLLOVERRIDES="mscoree,mshtml=" ; \
     wineboot --init ; wineserver -w ; \
     wine reg add "HKEY_CURRENT_USER\Software\Ensemble Studios\Age of Mythology Expansion\1.0" /v "EULA" /t REG_DWORD /d "1" /f ; \
     wine reg add "HKEY_CURRENT_USER\Software\Ensemble Studios\Age of Mythology Expansion\1.0" /v "PID" /t REG_SZ /d "11111-11111-11111-11111-11111" /f ; \
-    wine reg add "HKEY_CURRENT_USER\Software\Wine\Direct3D" /v "VideoPciVendorID" /t REG_DWORD /d "0x10de" /f ; \
-    wine reg add "HKEY_CURRENT_USER\Software\Wine\Direct3D" /v "VideoPciDeviceID" /t REG_DWORD /d "0x0402" /f ; \
+    wine reg add "HKEY_CURRENT_USER\Software\Wine\Direct3D" /v "VideoPciVendorID" /t REG_DWORD /d "0x8086" /f ; \
+    wine reg add "HKEY_CURRENT_USER\Software\Wine\Direct3D" /v "VideoPciDeviceID" /t REG_DWORD /d "0x2562" /f ; \
+    wine reg add "HKEY_CURRENT_USER\Software\Wine\Direct3D" /v "VideoMemorySize" /t REG_SZ /d "128" /f ; \
     wine reg add "HKEY_CURRENT_USER\Software\Wine\Drivers" /v "Audio" /t REG_SZ /d "null" /f ; \
     wine reg add "HKEY_CURRENT_USER\Software\Wine\X11 Driver" /v "Desktop" /t REG_SZ /d "800x600" /f ; \
     /usr/local/bin/winetricks -q directplay msxml4 d3dx9 mfc42 ; wineserver -w ; \
+    rm -rf /home/aomuser/.cache/winetricks/vcrun2015 ; \
+    /usr/local/bin/winetricks -q vcrun2015 ; wineserver -w ; \
     sleep 2 ; wineserver -k || true
 
 # 4. Finalise files & config
