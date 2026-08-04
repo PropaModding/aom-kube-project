@@ -154,6 +154,49 @@ session/connection-establishment protocol, only partially decoded so far:
 None of this is fully decoded yet — flagging the shapes above as a
 starting point for whoever picks this back up, not a finished spec.
 
+## Client resign/leave signature (2026-08-03)
+
+Captured a live 3-player match (host in Observer Mode + a "Standard"/Easy
+AI + a real client — see `run-aom-spoofed-client.sh`) where the client
+resigned mid-game. Source:
+`archiving/sessions/20260803-3v3-win-loss/session.pcap`, correlated
+against `clicks.log` from the same session (both use epoch timestamps —
+`record-session.sh`'s click-capture logic, run standalone since `sudo
+tcpdump` wasn't available interactively; packets captured instead via
+`kubectl debug` on the hostNetwork pod, same approach as the Direct
+Connect capture).
+
+Normal gameplay on UDP 2300 is a steady stream of the sequence-numbered
+packets described above (`03 00 <seq> <seq> <session-id> ...`, 10-50
+bytes). Resigning breaks that pattern sharply:
+
+1. Client sends **ten identical copies of a 3-byte packet** in under half
+   a millisecond: `01 <session-id-lo> <session-id-hi>` (`01 0b 04` in this
+   capture — `0b 04` matches the 2-byte session/connection ID already
+   present in this session's regular tick packets). Firing the same tiny
+   message many times in immediate succession, rather than relying on the
+   usual sequence-numbered delivery layer, strongly suggests this is a
+   best-effort "make sure this one lands no matter what" signal — losing a
+   resignation notice to packet loss would be a much worse failure mode
+   than losing a routine tick.
+2. Host replies once more with a single ordinary-looking tick packet
+   (still `03 00 ...` shaped, nothing distinctive).
+3. **Then nothing.** No further packets pass between host and that client
+   for the rest of the capture (many minutes) — a clean, total stop, not a
+   timeout/retry pattern.
+4. Cross-referencing `clicks.log`: a click landed ~1.2s before the burst
+   fired, consistent with Resign → confirm-dialog navigation taking about
+   that long before the network signal actually goes out.
+
+This looks like a solid, reusable signature for "this client just
+left/resigned": message type byte `0x01`, tiny fixed size, sent in a
+rapid burst, followed by total silence on that pairing. Not yet captured:
+what a **win** looks like from the surviving side's perspective — in this
+test the "winner" was either the AI (no client, so no network signal to
+observe) or the host (in Observer Mode, not a combat participant). That's
+the natural next capture: two real clients, one resigns, watch what the
+*other* client's connection sees.
+
 ## Open questions
 
 - What are the 8 non-zero `sin_zero` bytes? Possibly a sequence number,
