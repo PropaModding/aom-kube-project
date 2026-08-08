@@ -138,7 +138,25 @@ click 322 302 "nickname OK"
 # "<nickname>'s Game" ---
 click 560 170 "Host"
 
+# --- In-lobby host screen: bump Players from the default 2 to 3, so
+# there's an open slot for each of two real clients (this project only
+# hosts 1v1s, i.e. host + 2 joiners - see CLAUDE.md). The control is a
+# dropdown, not a text field or spinner arrows (confirmed by trial -
+# clicking it doesn't cycle a value, and it isn't keyboard-editable):
+# clicking the "Players" box opens a list (2-12) anchored so the
+# currently-selected value's row renders at the box's own position: click
+# (61, 63) to open it, then (55, 74) for the "3" row immediately below.
+# Calibrated by hand over VNC 2026-08-08 - not re-derived for other
+# player counts since 1v1 is the only format in scope.
+echo "[*] click (61, 63) - open Players dropdown"
+xdo mousemove 61 63 click 1
+sleep 1
+echo "[*] click (55, 74) - select 3 Players"
+xdo mousemove 55 74 click 1
+sleep "$STEP_DELAY"
+
 echo
-echo "Done - $POD should now be hosting \"${NICKNAME}'s Game\"."
+echo "Done - $POD should now be hosting \"${NICKNAME}'s Game\" with 3 Players"
+echo "(host + 2 open slots)."
 echo "Next: have clients Direct-Connect, then (once joined) manually click"
 echo "Observer Mode at (178, 563) if desired - see docs/host-flow.md."

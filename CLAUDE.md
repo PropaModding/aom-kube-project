@@ -17,9 +17,13 @@ spoofing DirectPlay 8 packets to support modern multiplayer hosting environments
 - `k8s/` — Deployment/Service manifests for all of the above
 - `deploy-minikube.sh` — builds/applies everything into a local minikube cluster
 - `docs/directplay8-protocol.md` — reverse-engineered wire protocol findings
-- `docs/lobby-status-api.md` — `aom-lobby`'s `GET /hosts` status endpoint (count of hosts waiting for players)
+- `docs/lobby-status-api.md` — `aom-lobby`'s `GET /hosts`/`GET /waiting` status endpoints
+- `docs/host-flow.md` — driving `aom-headless` from cold pod to hosted lobby via `xdotool`/VNC calibration
+- `docs/multi-peer-routing-design.md` — design (not yet implemented) for routing a full 1v1 match, not just client↔host — see Architecture intention below
+- `host-game-kube.sh` — automates hosting a game on `aom-headless` (EULA → menus → lobby, Players set to 3)
 - `run-aom-spoofed-client.sh` — one "second PC" container for testing Direct-Connect against the cluster
-- `run-aom-verbose-clients.sh` — two spoofed clients joining each other directly (no lobby/proxy), with full WINEDEBUG + in-container tcpdump byte capture, for diffing a genuinely successful connection against a failing proxied one
+- `run-aom-verbose-clients.sh` — two spoofed clients (host + 1 joiner) joining directly (no lobby/proxy), with full WINEDEBUG + in-container tcpdump byte capture, for diffing a genuinely successful connection against a failing proxied one
+- `run-aom-verbose-3clients.sh` — same, but host + 2 joiners, for capturing client↔client peer-to-peer traffic specifically
 
 ## Goals
 - Proxy UDP traffic on DirectPlay ports (2299/2300)
@@ -64,6 +68,26 @@ cluster's public address) — not LAN browsing. There is no pre-existing
 This is a substantial step up from the first working version (single
 always-on pod, static Quilkin config) — treat that version as the
 groundwork, not the end state.
+
+### Sessions are peer-to-peer, not host-relayed — the proxy has to route a whole match, not just client↔host
+
+Confirmed 2026-08-08 (non-proxied 3-container capture, see
+`docs/directplay8-protocol.md`'s "Sessions are genuinely peer-to-peer"
+section): once two real clients are in the same match, they open a
+**direct** UDP 2300 session with each other, bypassing the host entirely.
+`aom-lobby` today only proxies client↔host, so it has no way to see or
+relay that traffic at all — a second real client's connection currently
+hangs forever even after the client↔host relay itself is fully working,
+because neither client is ever told the other's real address.
+
+Since this project only ever hosts 1v1s (host in Observer Mode + exactly
+two real playing clients, see Goals above), the fix has a fixed, small
+scope: never more than 3 real peers, 3 pairwise relationships (host↔A,
+host↔B, A↔B). Full design — a dedicated relay port per pair, seeded by
+rewriting a newly-decoded address-broadcast message, plus durability
+requirements for one player dropping mid-match without disturbing the
+other — is written up in `docs/multi-peer-routing-design.md`. **Not yet
+implemented** — next session should start there.
 
 ### Dual client-variant support (retail DirectPlay + Voobly)
 

@@ -214,9 +214,19 @@ func (h *hostProbe) hasWaitingGame() bool {
 // fallback plumbing either way), sends UDP 2300 session data directly to
 // whatever address it believes the client is at rather than back through
 // this proxy's session listener. The session proxy uses this to know who
-// to relay that unsolicited traffic to. One client at a time, matching the
-// single-backend/no-multi-match architecture this whole pass targets - see
-// CLAUDE.md's Architecture intention for the eventual per-match design.
+// to relay that unsolicited traffic to.
+//
+// Its address is only trustworthy as an IP, not a port: it's updated from
+// discovery-port (2299) traffic, which uses a fresh ephemeral port per
+// query, not the fixed port a client's session-port (2300) traffic always
+// comes from - see relayBackendInitiated, which uses the tracker's IP as
+// a hint to pick the right *session*, rather than relaying to the
+// tracker's address directly. Still only one entry (not one per client) -
+// good enough to disambiguate "which client is this backend packet for"
+// among clients that have a session already vs. one that's still
+// connecting (see relayBackendInitiated), but not a real fix for multiple
+// simultaneous *pending* connections - see CLAUDE.md's Architecture
+// intention for the eventual per-match design.
 type clientTracker struct {
 	mu   sync.Mutex
 	addr *net.UDPAddr
@@ -355,9 +365,24 @@ func (p *proxy) run() {
 	}
 }
 
+// sessionClientAddrForIP returns the real client address (on this proxy's
+// own port) of an existing session belonging to ip, or nil if none does.
+// Used by relayBackendInitiated to turn clientTracker's IP-only-trustworthy
+// address into the right session when more than one might exist.
+func (p *proxy) sessionClientAddrForIP(ip net.IP) *net.UDPAddr {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, sess := range p.sessions {
+		if sess.clientAddr != nil && sess.clientAddr.IP.Equal(ip) {
+			return sess.clientAddr
+		}
+	}
+	return nil
+}
+
 // anySessionClientAddr returns the real client address of any one existing
-// session - fine given today's single-client-at-a-time scope (see
-// clientTracker's doc comment).
+// session - only used by relayBackendInitiated as a last-resort guess when
+// clientTracker doesn't point at a session of its own (see that method).
 func (p *proxy) anySessionClientAddr() *net.UDPAddr {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -372,18 +397,38 @@ func (p *proxy) anySessionClientAddr() *net.UDPAddr {
 // relayBackendInitiated handles a packet the backend sent unprompted to
 // this proxy's listening socket (rather than as a reply on a per-client
 // dialed connection) - see clientTracker's doc comment for why the backend
-// ends up doing this at all. No per-client session/dial bookkeeping is
-// needed here: there's only ever one real client at a time in today's
-// architecture, and this direction has no way to demultiplex multiple
-// clients anyway, since the backend always sends to this same well-known
-// listening address regardless of which client it means.
+// ends up doing this at all, and why the backend can't address such a
+// packet at a specific client itself: it always sends to this same
+// well-known listening address regardless of which client it means, since
+// every client looks identical to it (same rewritten proxy address).
+//
+// Picking the right client to relay to is therefore inferred, in order:
+//  1. Whichever real client most recently sent discovery-port traffic
+//     (clientTracker) - reliably whoever is currently mid-connect, since a
+//     client stops browsing/pinging once actually joined - matched by IP
+//     against this proxy's own sessions to find that same client's address
+//     *on this proxy's own port* (clientTracker's own port is wrong here,
+//     see its doc comment). This is what makes a second, still-connecting
+//     client resolve correctly even while a first client's already-
+//     established session exists (2026-08-08 fix - see
+//     docs/directplay8-protocol.md for the symptom this was causing: the
+//     backend's packets for a new client kept landing on an existing one
+//     instead).
+//  2. If no session matches that IP yet (the client hasn't sent its own
+//     first packet on this port), any one existing session - correct by
+//     construction when there's only one, a reasonable guess otherwise.
+//  3. If there are no sessions at all, the tracker's raw address - wrong
+//     port, so effectively a no-op send, but harmless and better than
+//     dropping the packet outright (matches pre-fix behavior for the
+//     single-client bootstrap case).
 func (p *proxy) relayBackendInitiated(payload []byte) {
-	// Prefer this proxy's own already-established session (has the real
-	// client's address *on this proxy's own port* - e.g. the session
-	// proxy's client might use a different local port for 2300 than for
-	// discovery on 2299). Only fall back to the cross-proxy tracker for
-	// the bootstrap case where no session exists yet on this proxy at all.
-	clientAddr := p.anySessionClientAddr()
+	var clientAddr *net.UDPAddr
+	if recent := p.tracker.get(); recent != nil {
+		clientAddr = p.sessionClientAddrForIP(recent.IP)
+	}
+	if clientAddr == nil {
+		clientAddr = p.anySessionClientAddr()
+	}
 	if clientAddr == nil {
 		clientAddr = p.tracker.get()
 	}

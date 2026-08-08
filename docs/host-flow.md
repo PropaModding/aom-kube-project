@@ -100,7 +100,18 @@ output/error — avoid chord key combos, prefer repeated single-key
 | # | Screen | Action | Coordinates |
 |---|--------|--------|--------------|
 | 7 | "LAN / Direct IP" — has a "Host a LAN Game" field (pre-filled `<nickname>'s Game`), a LAN games list, and a "Type a Direct IP" field | Click **Host** | (560, 170) |
-| 8 | In-lobby host screen (player list, game name, map/game settings, **Observer Mode** checkbox bottom-left, Cancel/Other Settings) | *(wait for a client to join here — see below)* | Observer Mode checkbox: (178, 563) |
+| 8 | In-lobby host screen (player list, game name, map/game settings, **Players** dropdown top-left, **Observer Mode** checkbox bottom-left, Cancel/Other Settings) | Set **Players** to 3 (host + 2 open slots - this project only hosts 1v1s, see CLAUDE.md), then *(wait for a client to join here — see below)* | Players dropdown: click (61, 63) to open, (55, 74) to select "3". Observer Mode checkbox: (178, 563) |
+
+**Players is a dropdown, not a text field or spinner** - confirmed by
+trial: clicking it doesn't cycle a value, and typing into it does
+nothing (it's not keyboard-editable). A single click opens a scrollable
+list (2-12) anchored so the *currently-selected* value's row renders at
+the box's own screen position, with each subsequent value 13px below
+that - e.g. from the default "2", the "3" row sits at (55, 74). Only
+calibrated for the 2→3 transition since 1v1 is the only format in scope
+here; other player counts would need their own calibration if ever
+needed. It defaults to "2" (host + 1 open slot) on every fresh host,
+which is enough for a single joiner but not for two.
 
 At step 8 the pod is actually listening on DirectPlay8's ports and
 answering discovery/Direct-Connect queries — this is the point
@@ -135,7 +146,11 @@ happened, then click the Observer Mode checkbox at (178, 563).
     sleep 5
 5.  (560, 170)  click   "Host" (LAN game name field is pre-filled)
     sleep 5
-6.  -- wait for a client join (poll aom-lobby logs) --
+6.  (61, 63)    click   open Players dropdown
+    sleep 1
+    (55, 74)    click   select "3" (host + 2 open slots)
+    sleep 5
+7.  -- wait for a client join (poll aom-lobby logs) --
     (178, 563)  click   "Observer Mode"
 ```
 

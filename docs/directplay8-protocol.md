@@ -467,6 +467,77 @@ backend's `type 0x02` ack now appears, the settings-sync layer
 the match successfully - first successful proxied Direct-Connect end to
 end.
 
+## Sessions are genuinely peer-to-peer, not host-relayed (2026-08-08)
+
+`aom-lobby` has only ever proxied client↔host. Confirmed via a 3-container
+non-proxied capture (host + two joiners, no `aom-lobby` involved -
+`run-aom-verbose-3clients.sh`, results archived in
+`archiving/sessions/20260808-234138-3client-p2p-check/`, see that
+directory's `NOTES.md`) that **once two real clients are in the same
+match, they open a direct UDP 2300 session with each other**, independent
+of the host - same 4-step handshake and settings-sync layer documented
+above, just running client↔client instead of client↔host. This is a real
+architecture gap for the proxy: it currently has no way to see or relay
+traffic between two clients at all, since neither one is ever told the
+other's real address - both are only ever told the proxy's address for
+"the host."
+
+**How a client learns about another client's address**: found by
+searching the host's own traffic to the first-joined client for the
+second client's IP right before their direct session started. The host
+sends a settings-sync (`03 00`-wrapped) message with a previously-
+undocumented sub-type, `0x29`, to each *already-connected* peer whenever
+a *new* peer joins:
+
+```
+03 00 <seq> <conn-id>              common wrapper (see above)
+29 00                              sub-type 0x29 - "new peer's address"
+1c 01 00 00 00                     unclear, constant-shaped so far
+<sockaddr_in>                      new peer's real address, family/port/
+                                    addr - 16 bytes, same shape as every
+<sockaddr_in>                      other address-carrying message - and
+                                    duplicated, also matching every other
+                                    such message
+03 00 00 00                        unclear
+53 00                              unclear (varies - possibly a length
+                                    or checksum trailer)
+```
+
+Byte offsets within the payload (after the 8-byte wrapper is stripped):
+the two `sockaddr_in` blocks sit at offsets 13 and 29 - i.e. rewriting
+this the same way `discoveryRewrite` already rewrites `0x26`/`0x21`/
+`0x20` just needs its own offset-table entry keyed on (wrapper type
+`0x03`, sub-type `0x29`) rather than the top-level type byte alone,
+since this message is nested one level deeper than the discovery-port
+messages.
+
+**Confirmed asymmetric - the new peer is never told about existing
+peers.** At the same moment, the host sends the *newly-joining* client a
+different 31-byte message (also `03 00`-wrapped, a `0x15`-length
+sub-payload of small integers, no embedded address at all - reads like a
+player-slot roster, not an address list). The new peer doesn't need to be
+told anyone else's address: it just listens on its own session port, and
+whichever existing peer *was* told about it (via the `0x29` broadcast)
+reaches out first, unprompted - the same "proactive, unprompted `type
+0x00`" pattern already documented for the client↔host handshake. The new
+peer then learns the reaching-out peer's address the ordinary way, from
+that packet's real source address.
+
+**Scope note**: this project only ever hosts 1v1s (host in Observer Mode
++ exactly two real playing clients, per CLAUDE.md), so the maximum is 3
+real peers and 3 pairwise relationships (host↔A, host↔B, A↔B) - never
+more than one already-connected peer needing to learn about one new peer
+at a time. Whether a 3rd *already-connected* peer would get the `0x29`
+broadcast directly from the host or relayed peer-to-peer from an existing
+client is unconfirmed and, given the 1v1-only scope, not expected to
+matter.
+
+**Not yet captured**: what happens on this channel when one player drops
+mid-match and a new player joins the vacated slot - relevant to
+`aom-lobby`'s planned per-pair relay design needing correct teardown/
+reuse semantics (see the design doc this finding feeds into, once
+written).
+
 ## Open questions
 
 - What are the 8 non-zero `sin_zero` bytes? Possibly a sequence number,
