@@ -1,6 +1,6 @@
-# aom-lobby status API: how many hosts are waiting for players
+# aom-lobby status API: hosts waiting for players
 
-`aom-lobby` serves a small HTTP endpoint alongside its DirectPlay8 UDP
+`aom-lobby` serves small HTTP endpoints alongside its DirectPlay8 UDP
 relay, so you can check from a shell how many hosts are currently open
 and waiting for players to join, without launching AoM's own client to
 look.
@@ -9,13 +9,20 @@ look.
 
 ```
 curl http://$(minikube ip):8080/hosts
+curl http://$(minikube ip):8080/waiting
 ```
 
-Returns a single integer, newline-terminated (e.g. `1`) — the number of
-hosts currently answering as open. Since `aom-lobby` runs with
-`hostNetwork: true`, port 8080 is reachable directly at the minikube
-node's IP, same as UDP 2299/2300 — no separate `kubectl port-forward`
-needed, no auth.
+`/hosts` returns a single integer, newline-terminated (e.g. `1`) — the
+number of hosts currently answering as open. `/waiting` returns `true` or
+`false` — whether there's currently a game with a player (the host)
+waiting for an opponent, i.e. `/hosts` != 0. It's the signal matchmaking
+will use to decide whether a newly-connecting client can be routed into
+an existing game rather than provisioning a new pod (`hostProbe.
+hasWaitingGame()` in `lobby/main.go`) — round-robin across *multiple*
+waiting games is future work, see "Current scope" below. Since
+`aom-lobby` runs with `hostNetwork: true`, port 8080 is reachable
+directly at the minikube node's IP, same as UDP 2299/2300 — no separate
+`kubectl port-forward` needed, no auth.
 
 ## How it decides "open"
 
@@ -33,13 +40,17 @@ reply, so the count correctly drops to 0. This is implemented in
 
 Today `aom-lobby` relays to a single static backend
 (`aom-headless-game`, see `k8s/lobby-deployment.yaml`), so `/hosts`
-only ever returns `0` or `1`. Per CLAUDE.md's Architecture intention,
-matches will eventually be provisioned on demand across multiple
-`aom-headless` pods with the lobby routing between them — at that point
-`hostProbe` becomes a set of probes (one per known backend) summed
-together, and `/hosts` starts returning genuinely plural counts. Nothing
-about the `/hosts` API itself needs to change for that; only what feeds
-it does.
+only ever returns `0` or `1`, and `hasWaitingGame()`/`/waiting` just
+mirrors that same single probe's state. Per CLAUDE.md's Architecture
+intention, matches will eventually be provisioned on demand across
+multiple `aom-headless` pods with the lobby routing between them — at
+that point `hostProbe` becomes a set of probes (one per known backend)
+summed together for `/hosts`, and matchmaking will need to pick a
+*specific* waiting probe to route a client into (round-robin or
+otherwise) rather than just a yes/no across all of them — that's why
+`hasWaitingGame()` is kept as its own method on `hostProbe` rather than
+folded into `count()`. Nothing about the `/hosts`/`/waiting` APIs
+themselves needs to change for that; only what feeds them does.
 
 ## Config
 

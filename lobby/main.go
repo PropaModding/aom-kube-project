@@ -192,6 +192,20 @@ func (h *hostProbe) count() int {
 	return 0
 }
 
+// hasWaitingGame reports whether this backend currently has an open lobby
+// with a host waiting for an opponent - the signal matchmaking needs to
+// route a newly-connecting client into an existing game rather than
+// provisioning a new pod. Same underlying check as count() (one backend
+// today, so the two currently agree) - kept as its own method because once
+// there's a slice of probes, one per on-demand pod (see CLAUDE.md's
+// Architecture intention), matchmaking will want to pick a specific
+// waiting probe to round-robin into, not just a yes/no across all of them.
+func (h *hostProbe) hasWaitingGame() bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.open
+}
+
 // clientTracker remembers the most recently seen real client address,
 // shared between the discovery and session proxies. It exists because the
 // backend pod, once it learns a client's real address (from the
@@ -605,8 +619,11 @@ func main() {
 	statusMux.HandleFunc("/hosts", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%d\n", probe.count())
 	})
+	statusMux.HandleFunc("/waiting", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%t\n", probe.hasWaitingGame())
+	})
 	go func() {
-		log.Printf("aom-lobby: status endpoint on %s (GET /hosts -> number of hosts waiting for players)", cfg.statusListenAddr)
+		log.Printf("aom-lobby: status endpoint on %s (GET /hosts -> number of hosts waiting for players, GET /waiting -> is there a game with a player waiting)", cfg.statusListenAddr)
 		if err := http.ListenAndServe(cfg.statusListenAddr, statusMux); err != nil {
 			log.Fatalf("status server on %q: %v", cfg.statusListenAddr, err)
 		}
