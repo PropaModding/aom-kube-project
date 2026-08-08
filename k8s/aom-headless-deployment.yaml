@@ -19,14 +19,11 @@ spec:
       labels:
         app: aom-headless
     spec:
-      # Host network so DirectPlay8's fixed ports (2299/2300) are reachable
-      # straight on the minikube node's own IP — AoM's Direct Connect field
-      # has no port entry, so a NodePort remap (which lands outside
-      # 2299/2300 by default) wouldn't work without a proxy in front of it.
-      # Only put one pod on hostNetwork per node: a second hostNetwork pod
-      # on the same node would collide on these same ports.
-      hostNetwork: true
-      dnsPolicy: ClusterFirstWithHostNet
+      # No hostNetwork here anymore: the node's real 2299/2300 now belong to
+      # aom-lobby and quilkin (see k8s/lobby-deployment.yaml and
+      # k8s/quilkin-deployment.yaml), which sit in front of this pod and
+      # rewrite/relay traffic to it via the aom-headless-game Service below.
+      # This pod only needs a normal, in-cluster pod IP.
       containers:
         - name: aom
           image: aom-k8s:latest
@@ -42,6 +39,12 @@ spec:
           ports:
             - name: vnc
               containerPort: 5900
+            - name: dp8-discovery
+              containerPort: 2299
+              protocol: UDP
+            - name: dp8-session
+              containerPort: 2300
+              protocol: UDP
           resources:
             requests:
               cpu: "500m"
@@ -61,4 +64,24 @@ spec:
     - name: vnc
       port: 5900
       targetPort: 5900
+  type: ClusterIP
+---
+# Stable in-cluster address for the real pod's DirectPlay8 ports, so
+# aom-lobby and quilkin don't have to chase pod IPs across restarts.
+apiVersion: v1
+kind: Service
+metadata:
+  name: aom-headless-game
+spec:
+  selector:
+    app: aom-headless
+  ports:
+    - name: dp8-discovery
+      port: 2299
+      targetPort: 2299
+      protocol: UDP
+    - name: dp8-session
+      port: 2300
+      targetPort: 2300
+      protocol: UDP
   type: ClusterIP

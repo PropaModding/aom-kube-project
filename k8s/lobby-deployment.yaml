@@ -1,0 +1,80 @@
+# aom-lobby: the fake DirectPlay8 lobby. Sits on the node's real UDP
+# 2299 *and* 2300 (hostNetwork, same justification aom-headless used to
+# have: AoM's Direct-IP field has no port entry, so these fixed ports
+# can't be remapped behind a NodePort). Relays both to the real game pod
+# via aom-headless-game, rewriting embedded addresses so the pod never
+# sees a client's real address and vice versa - discovery/ping replies on
+# 2299, and the 2300 session handshake's leaked "self" address (see
+# lobby/main.go and docs/directplay8-protocol.md for why 2300 needs this
+# too, not just 2299).
+#
+# Quilkin is currently parked (see quilkin-deployment.yaml) - with a
+# single static backend pod it wasn't earning its keep, so the lobby
+# relays 2300 straight to aom-headless-game itself for now. Quilkin comes
+# back once there's more than one backend pod to route between.
+#
+# PUBLIC_ADDR isn't known until the cluster exists (it's the minikube
+# node's own IP) — deploy-minikube.sh patches it in after apply.
+#
+# Also serves a small HTTP status endpoint on 8080 (also on the node's
+# real IP via hostNetwork, same as 2299/2300) - GET /hosts returns the
+# number of hosts currently open and waiting for players, e.g.:
+#   curl http://$(minikube ip):8080/hosts
+# See docs/lobby-status-api.md.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aom-lobby
+  labels:
+    app: aom-lobby
+spec:
+  replicas: 1
+  # hostNetwork means only one pod on this node can ever bind these ports
+  # at a time — the default RollingUpdate strategy tries to bring the new
+  # pod up *before* killing the old one, which deadlocks forever on a
+  # single-node cluster (new pod can't schedule, old pod never dies to
+  # free the ports). Recreate kills the old pod first instead.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: aom-lobby
+  template:
+    metadata:
+      labels:
+        app: aom-lobby
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: aom-lobby
+          image: aom-lobby:latest
+          imagePullPolicy: Never # image is loaded straight into the node, not pulled from a registry
+          ports:
+            - name: dp8-discovery
+              containerPort: 2299
+              protocol: UDP
+            - name: dp8-session
+              containerPort: 2300
+              protocol: UDP
+            - name: status-http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: ":2299"
+            - name: AOM_BACKEND_ADDR
+              value: "aom-headless-game:2299"
+            - name: SESSION_LISTEN_ADDR
+              value: ":2300"
+            - name: SESSION_BACKEND_ADDR
+              value: "aom-headless-game:2300"
+            - name: PUBLIC_ADDR
+              value: "127.0.0.1" # placeholder, patched to `minikube ip` by deploy-minikube.sh
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "64Mi"

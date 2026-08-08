@@ -1,0 +1,16 @@
+# Fake DirectPlay8 lobby: a small UDP proxy that stands in front of the
+# real AoM game pod's discovery port (2299), rewriting the embedded host
+# address in discovery/ping replies to point at Quilkin's public endpoint
+# instead. See lobby/main.go and docs/directplay8-protocol.md.
+
+FROM golang:1.22-alpine AS builder
+WORKDIR /src
+COPY lobby/go.mod ./
+COPY lobby/main.go ./
+RUN CGO_ENABLED=0 go build -o /aom-lobby .
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /aom-lobby /usr/local/bin/aom-lobby
+EXPOSE 2299/udp
+ENTRYPOINT ["/usr/local/bin/aom-lobby"]

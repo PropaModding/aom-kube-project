@@ -11,6 +11,16 @@ Capture method: `record-session.sh` (tcpdump, `CAPTURE_FILTER=udp`) +
 `tcpdump -tt -r` / `tcpdump -X` for payload inspection. Source session:
 `archiving/sessions/20260802-231930/session.pcap`, 2026-08-02.
 
+**Scope (2026-08-07): this entire document covers only the classic
+No-CD/DirectPlay client (`aomxnocd1.exe`).** Per CLAUDE.md's Goals, the
+project also needs to support the separately-networked Voobly-modernised
+client, which is expected to use its own protocol entirely (reportedly a
+single multiplexed UDP port, ~16000) rather than classic DirectPlay on
+2299/2300. That hasn't been captured or reverse-engineered at all yet —
+every capture taken during this project so far, including the
+extensive 2026-08-07 debugging session, only ever drove `aomxnocd1.exe`.
+Nothing here should be assumed to apply to Voobly traffic.
+
 ## Ports
 
 | Port | Purpose |
@@ -87,13 +97,23 @@ Sent once per browse-screen refresh cycle, after the repeating 0x25/0x26
 broadcast exchange, directly between client and host (not broadcast):
 
 ```
-client -> host:  20 01 00 00 00  <sockaddr_in>   (no name string)
-host   -> client: 21 01 00 00 00  <sockaddr_in>   (no name string)
+client -> host:  20 01 00 00 00  <sockaddr_in> <sockaddr_in>   (no name string)
+host   -> client: 21 01 00 00 00  <sockaddr_in> <sockaddr_in>   (no name string)
 ```
 
-Same `sockaddr_in` shape as the discovery reply, minus the name. Best
-guess: this is what the game uses to compute/display a ping time per
-listed entry, independent of the broadcast enumeration.
+**Correction (2026-08-07):** originally documented as a single
+`sockaddr_in` block. A raw hex dump of `aom-lobby`'s traffic showed the
+0x21 reply is 41 bytes — 5-byte header + **two** 16-byte `sockaddr_in`
+blocks (same double-block shape as the 0x26 reply) + 4 trailing zero
+bytes, not one block + 20 bytes of something else. `aom-lobby` was only
+rewriting the first block and leaking the real backend pod's internal IP
+in the second, unrewritten, straight to an external client — which is
+exactly the kind of address a client would reasonably reachability-check
+before allowing you to Join, and it silently refused to. Fixed in
+`lobby/main.go`'s `discoveryAddressOffsets` (`0x21: {5, 21}`, matching
+0x26). Best guess for the message's purpose is still: this is what the
+game uses to compute/display a ping time per listed entry, independent
+of the broadcast enumeration.
 
 ## Practical implications for the Quilkin proxy / spoofing work
 
@@ -197,6 +217,256 @@ observe) or the host (in Observer Mode, not a combat participant). That's
 the natural next capture: two real clients, one resigns, watch what the
 *other* client's connection sees.
 
+## Post-handshake session-settings sync on UDP 2300 (2026-08-07)
+
+First captured (sizes only, via `aom-lobby`'s hex-dump logging) while
+debugging a proxied Direct-Connect attempt that reaches "Attempting to
+Connect" but never completes. **Fully decoded with real payload bytes**
+shortly after, from a genuine, visually-confirmed-successful connection
+between two independent spoofed clients (`run-aom-verbose-clients.sh`,
+host `192.168.49.3` / joiner `192.168.49.4`, real `tcpdump` run inside
+each container — see that script for why capturing from outside doesn't
+see this traffic). This is the layer that runs immediately after the
+already-documented 40-byte self/peer handshake and 41-byte ping variant,
+and carries the actual lobby-sync data: player identities and map choice.
+
+### Common wrapper
+
+Every message in this layer shares an 8-byte header:
+
+```
+03 00                     type (constant across all of these)
+<2-byte seq>               increments per message, per sender
+<2-byte connection ID>     stable per sender for the life of the session
+                            (matches the port/id learned during the
+                            0x20/0x21 ping exchange)
+<remaining bytes>          sub-message, varies by purpose (see below)
+```
+
+Both sides send this type repeatedly and independently — seq and
+connection ID are per-sender, not a shared conversation counter.
+
+### Player-announce sub-message (93 bytes total this capture)
+
+```
+01 08 02 16 16                       sub-header (constant shape observed)
+<4 bytes>                            unclear, possibly a settings/version flag
+24 30 27 00 00 00 00 00 00           unclear, possibly a numeric player ID or slot flag
+7b <GUID as ASCII, with braces> 7d 00    player's DirectPlay GUID
+<4 bytes, 00 00 00 00>               padding/alignment
+0e 00                                length prefix (14, little-endian)
+<UTF-16LE nickname>\0                length-prefixed like the 0x26 reply's
+                                      name field, but here it's the PLAYER's
+                                      nickname, not the game/session name
+```
+
+**Both nicknames used in this test decode cleanly**, each paired with a
+distinct per-player GUID:
+
+| Role | GUID | Nickname (UTF-16LE) |
+|---|---|---|
+| Host | `{2BDE4F69-94BF-4AA0-99DB-C3DA00925458}` | `host` |
+| Joiner | `{CE7FDE55-F6EF-4700-A604-D4C22FA3B33E}` | `client` |
+
+Each side announces itself with this message shape (host→joiner and
+joiner→host both observed, each with their own GUID/nickname/seq/conn-ID)
+— it's a self-announcement, not something only the host sends.
+
+### Map-name sub-message (139 bytes total this capture, host→joiner only)
+
+Same 8-byte wrapper, followed by a differently-shaped sub-message
+containing more binary fields (unclear purpose — possibly game settings
+flags/difficulty/handicap, not yet decoded) and, readably:
+
+```
+66 00 61 00 73 00 74 00 72 00 61 00 6e 00 64 00
+6f 00 6d 00 2e 00 73 00 65 00 74 00
+```
+= UTF-16LE **`"fastrandom.set"`** — reads as a map/scenario file
+identifier (`.set` extension), strongly likely the chosen map for this
+match ("Random" per the host's own in-lobby map selector at the time of
+capture). Same packet also repeats the session name (`"host's Game"`,
+UTF-16LE, matching the 0x26 discovery reply's field) later in the payload.
+
+### Type 0x03 sub-type with a constant string ("paullovesjade")
+
+```
+03 00 <seq> <conn-id> 0e 00
+70 61 75 6c 6c 6f 76 65 73 6a 61 64 65 00     ASCII "paullovesjade\0"
+00 00
+```
+
+The length prefix (`0e 00` = 14) exactly matches
+`len("paullovesjade\0")`, so the decode is solid — and notably **ASCII,
+not UTF-16LE** like every other string field in this protocol.
+
+**Correction:** originally flagged as possibly tied to a patched-out
+CD-key/version check, since it fired constantly and didn't match either
+side's real nickname (`TheIP` in that test). That hypothesis is now
+disproven: this exact same string, byte-for-byte, appears in the
+`run-aom-verbose-clients.sh` capture too — a connection that genuinely
+succeeded. A CD-key rejection couldn't produce a working connection, so
+whatever this is, it isn't gating anything. It's constant across sessions
+and unrelated to either player's real nickname (confirmed above), so the
+most likely explanation is still that it's baked into `aomxnocd1.exe`
+itself — plausibly a signature left by whoever built the No-CD crack,
+sitting in a reused buffer rather than being genuinely player-supplied.
+Harmless artifact, not a protocol requirement — nothing to replicate.
+
+### Type 0x07ff (10 bytes)
+
+```
+07 ff                                header
+<2-byte seq>                         matches a same-sender 0x03 message's seq
+<2-byte connection ID>                matches a same-sender 0x03 message's ID
+00 00 00 00                          padding
+```
+
+No text content. Fired frequently by both sides (seq/conn-ID matching
+whichever sub-message it's paired with) — a lightweight ack/heartbeat for
+this layer, not an independent message in its own right.
+
+### Lobby chat (41 bytes this capture)
+
+Captured live from `run-aom-verbose-clients.sh`'s two containers sitting
+together in the joined lobby, one player typing a chat message to the
+other. Same `0x03` wrapper as everything else in this layer:
+
+```
+03 00 <seq> <conn-id>                 wrapper header
+1f 00                                 length prefix
+01 47 04 0a 00 00 00                  sub-header/flags, not yet decoded
+62 00 6c 00 61 00 68 00 20 00         UTF-16LE
+62 00 6c 00 61 00 68 00 00 00
+00 00 00 00 68 0c                     trailing bytes, not yet decoded
+```
+
+The UTF-16LE bytes decode cleanly to the literal message sent:
+**`"blah blah"`**. Confirms directly (not just by absence-of-TCP
+elsewhere) that in-lobby chat rides the same UDP 2300 channel as
+discovery/handshake/settings-sync — see "Open questions" below on the
+still-undecoded sub-header, but the text payload format itself
+(UTF-16LE, no separate framing beyond this wrapper) is confirmed.
+
+## Connection-establishment handshake has 4 steps, not 2 (2026-08-08)
+
+The already-documented 40-byte self/peer packet (`## UDP 2300 session
+handshake`, above) turns out to be only *half* of the real handshake.
+Found by diffing a live-failing proxied Direct-Connect attempt (`aom-lobby`
+with `VERBOSE=1`, plus the spoofed client's own `WINEDEBUG` trace) against
+a genuinely successful, non-proxied connection captured fresh via
+`run-aom-verbose-clients.sh` (host `192.168.49.3`, joiner `192.168.49.4`,
+real `tcpdump -i eth0` inside each container). Both captures line up
+byte-for-byte on everything below except the one step called out as
+missing.
+
+**Two message types are involved, both 40 bytes, both starting with a
+1-byte type tag at offset 0** (previously only type `0x00` was
+documented):
+
+```
+type 0x00 ("open"/self-announce) - the one already documented above:
+  bytes 0-1:  00 00                  type
+  bytes 2-3:  <sender's own ID>      arbitrary per-sender, NOT an echo of
+                                      anything - just this sender's tag
+                                      for this connection attempt
+  bytes 4-7:  d8 f6 32 00             constant - identical across every
+                                      sender in both captures (host,
+                                      joiner, and the proxied client) -
+                                      a fixed protocol value, not
+                                      per-session data
+  bytes 8-23: self sockaddr_in block (family/port/addr + 8 non-zero
+              sin_zero bytes, see "Open questions")
+  bytes 24-39: peer sockaddr_in block (same shape)
+
+type 0x02 (handshake ack) - newly identified:
+  bytes 0-1:  02 00                  type
+  bytes 2-3:  <sender's own ID>      same value this sender used in its
+                                      own type 0x00 (not a new one)
+  bytes 4-5:  <peer's ID>            echoes the 2-byte ID field the OTHER
+                                      side used in the type 0x00 this is
+                                      acknowledging
+  bytes 6-39: 00 00 00 00 00 00 00 e9 e9 7f a4 00 01 00 18 f7 32 00
+              3f e4 d4 7f a4 00 01 00 01 00 00 00 18 f7 32 00
+              - byte-for-byte IDENTICAL in every type 0x02 seen so far,
+                across totally separate Wine process instances in two
+                unrelated captures. Same reasoning as the "paullovesjade"
+                string below: identical bytes across independent runs
+                rules out a memory pointer/per-session token, so this is
+                almost certainly a fixed protocol constant, not something
+                requiring translation. Not yet decoded further.
+```
+
+Neither message embeds anything beyond the two `sockaddr_in` blocks in
+type `0x00` - type `0x02` carries no address data at all, so it needs no
+rewriting and can (and should) be forwarded byte-for-byte.
+
+**The real 4-step sequence** (confirmed from the genuine capture's
+microsecond-timestamped pcap):
+
+1. **Host → Joiner: type `0x00`.** Sent unprompted, based on the address
+   the host already learned during the discovery-phase `0x20`/`0x21` ping
+   exchange - *before* the joiner has sent anything at all on port 2300.
+   Retried every ~100ms (5 copies seen in the reference capture) until
+   the joiner replies.
+2. **Joiner → Host: type `0x00`** (its own self-announce, mirroring step
+   1's shape with its own address) **and type `0x02`** (acking the host's
+   ID from step 1) - sent back-to-back, together, as soon as the joiner
+   receives step 1.
+3. **Host → Joiner: type `0x02`**, acking the joiner's ID from step 2.
+   Sent once.
+4. Normal traffic (the `07ff` heartbeat / `03 00`-wrapped settings-sync
+   layer documented below) begins on both sides.
+
+**Where the proxied attempt breaks down**: steps 1-2 above happen
+correctly and are confirmed byte-perfect through `aom-lobby` - this is
+the fix documented in "UDP 2300 session handshake"'s 2026-08-07
+correction (rewriting *both* self and peer on the backend→client leg).
+The client's step-2 type `0x02` ack also goes through untouched and
+correctly references the backend's real connection ID. **But step 3 -
+the backend's own type `0x02` ack - never happens.** Not misrouted, not
+malformed: checked the full session's traffic in both directions and
+there is no type `0x02` (or any 40-byte non-handshake message) from
+backend→client anywhere in the log, ever. Lacking it, the client's
+connect-retry timer never clears: it just keeps re-sending its original
+step-1-equivalent type `0x00` (over 1200 times across ~2 minutes in one
+capture) while the backend, apparently satisfied, moves straight into
+heartbeat/settings-sync chatter as if the join had already succeeded.
+After the client eventually gives up (~2 minutes) and returns to the LAN
+browse screen, the backend sends the already-documented 3-byte `01
+<connID>` "peer is gone" burst (see "Client resign/leave signature",
+above) - new information there too: that signature was previously only
+seen client→host on a player resigning mid-game, so it's evidently a
+generic bidirectional "this peer disappeared" signal, not resign-specific.
+
+**Root cause found and fixed (2026-08-08).** A raw `tcpdump` on the
+minikube node during a live proxied attempt (`-i any`, catching both the
+client↔`aom-lobby` and `aom-lobby`↔backend legs with real microsecond
+timestamps - same trick already validated for `aom-lobby` traffic
+specifically because the node is one of the two real endpoints there,
+see `run-aom-verbose-clients.sh`'s header comment for why that doesn't
+work for sibling-container traffic but does here) showed the actual
+bug: when `aom-lobby` rewrites the client's type `0x00` before forwarding
+it to the backend, the *self* field's port was set to
+`sess.backendConn.LocalAddr().Port` - the proxy's own ephemeral
+outbound socket port (e.g. `54031`), which is different every session -
+instead of the stable public port (`2300`) that discovery/ping had
+already told the backend to expect the peer at. So the backend ended up
+holding two contradictory addresses for what should have been the same
+peer (`:2300` from its own proactively-sent type `0x00`, `:54031` from
+the client's rewritten one) and never correlated them into one session -
+hence no step-3 ack. `rewriteToClient`'s equivalent field (the
+backend→client direction) was already correct - it hardcodes
+`cfg.publicPort` - so this was a same-file asymmetry, not a
+deeper protocol misunderstanding. Fixed in `lobby/main.go`'s session
+`rewriteToBackend` closure: `port := sess.backendConn.LocalAddr()...`
+replaced with the same `cfg.publicPort` constant. **Confirmed working**
+against a live Direct-Connect immediately after redeploying: the
+backend's `type 0x02` ack now appears, the settings-sync layer
+(player-announce/map-name messages) starts flowing, and the client joins
+the match successfully - first successful proxied Direct-Connect end to
+end.
+
 ## Open questions
 
 - What are the 8 non-zero `sin_zero` bytes? Possibly a sequence number,
@@ -211,3 +481,7 @@ the natural next capture: two real clients, one resigns, watch what the
   above) — what the two incrementing counters actually track, what the
   8-byte header before each sockaddr pair means, and whether the apparent
   pointer leak is real or a misread.
+- What are the constant bytes in type `0x00` (`d8 f6 32 00`, bytes 4-7)
+  and type `0x02` (the 34-byte tail starting at byte 6)? Identical across
+  every sender/session observed so far, so almost certainly fixed
+  protocol values rather than per-session data, but not yet decoded.

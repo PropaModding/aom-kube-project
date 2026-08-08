@@ -1,0 +1,80 @@
+# quilkin: plain UDP forwarder for the actual DirectPlay8 session traffic
+# (UDP 2300) to the real game pod.
+#
+# PARKED (replicas: 0) as of 2026-08-05: aom-lobby now relays 2300 itself
+# (see k8s/lobby-deployment.yaml), including the address-rewrite the 2300
+# handshake needs - with a single static backend pod, quilkin wasn't
+# adding anything a direct relay didn't already do. It comes back once
+# there's more than one backend pod and real per-match routing is needed
+# (quilkin's Capture/TokenRouter filters, driven off a per-match token) -
+# left deployed at 0 replicas rather than deleted so that wiring doesn't
+# start from scratch. Scale back up with
+# `kubectl scale deployment/quilkin --replicas=1`.
+#
+# `us-docker.pkg.dev/quilkin/release/quilkin` (what quilkin.dev's v0.9.0
+# docs point at) 404s/denies unauthenticated pulls as of 2026-08 — the
+# project's actual published images moved to
+# ghcr.io/embarkstudios/quilkin:<version>-<short_commit> with a
+# correspondingly different flag-driven CLI (no more `proxy`/`manage`
+# subcommands or clusters/endpoints YAML — see `quilkin --help` on the
+# image itself, it's authoritative over the docs site). Config is passed
+# as flags directly rather than a mounted quilkin.yaml/ConfigMap for this
+# pass, since a single static endpoint doesn't need one.
+#
+# `--provider.static.endpoints` needs a literal IP:port, not a DNS name —
+# it's set as an env var (has a `QUILKIN_PROVIDERS_STATIC_ENDPOINTS=`
+# equivalent per `quilkin --help`) so deploy-minikube.sh can resolve
+# aom-headless-game's ClusterIP and patch it in after the Service exists,
+# same pattern as aom-lobby's PUBLIC_ADDR.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: quilkin
+  labels:
+    app: quilkin
+spec:
+  replicas: 0
+  selector:
+    matchLabels:
+      app: quilkin
+  template:
+    metadata:
+      labels:
+        app: quilkin
+    spec:
+      containers:
+        - name: quilkin
+          image: ghcr.io/embarkstudios/quilkin:0.10.0-9c2e65d
+          env:
+            - name: QUILKIN_SERVICE_UDP
+              value: "true"
+            - name: QUILKIN_SERVICE_UDP_PORT
+              value: "7000"
+            - name: QUILKIN_PROVIDERS_STATIC_ENDPOINTS
+              value: "127.0.0.1:2300" # placeholder, patched by deploy-minikube.sh once aom-headless-game's ClusterIP is known
+          ports:
+            - name: dp8-session
+              containerPort: 7000
+              protocol: UDP
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "64Mi"
+            limits:
+              cpu: "500m"
+              memory: "128Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: quilkin-session
+spec:
+  selector:
+    app: quilkin
+  type: NodePort
+  ports:
+    - name: dp8-session
+      port: 7000
+      targetPort: 7000
+      nodePort: 30300
+      protocol: UDP
