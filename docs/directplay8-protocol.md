@@ -115,7 +115,7 @@ before allowing you to Join, and it silently refused to. Fixed in
 game uses to compute/display a ping time per listed entry, independent
 of the broadcast enumeration.
 
-## Practical implications for the Quilkin proxy / spoofing work
+## Practical implications for the proxy/spoofing work
 
 - The `sockaddr_in` embedded in the 0x26 reply and the 0x20/0x21 ping is
   the thing that needs rewriting if traffic is being proxied/NATed —
@@ -503,25 +503,80 @@ a *new* peer joins:
                                     or checksum trailer)
 ```
 
-Byte offsets within the payload (after the 8-byte wrapper is stripped):
-the two `sockaddr_in` blocks sit at offsets 13 and 29 - i.e. rewriting
-this the same way `discoveryRewrite` already rewrites `0x26`/`0x21`/
-`0x20` just needs its own offset-table entry keyed on (wrapper type
-`0x03`, sub-type `0x29`) rather than the top-level type byte alone,
-since this message is nested one level deeper than the discovery-port
-messages.
+**Correction (2026-08-10):** the "common wrapper" is 6 bytes, not 8 -
+`03 00` (type) + 2-byte seq + 2-byte conn-id, matching the "Common
+wrapper" section above; there's no extra padding. The sub-type byte
+sits at absolute offset 6, and the two `sockaddr_in` blocks sit at
+**absolute** offsets 13 and 29 in the raw packet - not "after an 8-byte
+wrapper is stripped" as originally written here. Confirmed against a
+real captured packet (2-client join test through `aom-lobby`, VERBOSE
+logging): `03 00 43 00 2c 10 29 00 1c 01 00 00 00 <sockaddr1 @ 13>
+<sockaddr2 @ 29> 03 00 00 00 1c 00`, decoding cleanly with these
+offsets. Rewriting this the same way `discoveryRewrite` already
+rewrites `0x26`/`0x21`/`0x20` just needs its own offset-table entry
+keyed on (wrapper type `0x03`, sub-type `0x29`) rather than the
+top-level type byte alone, since this message is nested one level
+deeper than the discovery-port messages.
 
-**Confirmed asymmetric - the new peer is never told about existing
-peers.** At the same moment, the host sends the *newly-joining* client a
-different 31-byte message (also `03 00`-wrapped, a `0x15`-length
-sub-payload of small integers, no embedded address at all - reads like a
-player-slot roster, not an address list). The new peer doesn't need to be
-told anyone else's address: it just listens on its own session port, and
-whichever existing peer *was* told about it (via the `0x29` broadcast)
-reaches out first, unprompted - the same "proactive, unprompted `type
-0x00`" pattern already documented for the client↔host handshake. The new
-peer then learns the reaching-out peer's address the ordinary way, from
-that packet's real source address.
+**Also confirmed, and this is the actual root cause of the second
+client's "Attempting to Connect" hang**: the captured packet's embedded
+address decoded to `192.168.49.2:2300` - `aom-lobby`'s own public
+address, not either real client's IP. This isn't a decoding error: it's
+because the existing session-port rewrite (`sessionSelfOffset` in
+`lobby/main.go`) always overwrites a client's "self" field with the
+same constant `cfg.publicIP:cfg.publicPort` for *every* client, so the
+backend can never actually record a distinguishing address for any
+client - it always sees "the client" as the proxy itself. When the host
+broadcasts a new peer's address to an existing peer, it's relaying back
+whatever address it recorded for that peer, which is always this same
+fixed value. The existing peer ends up told to open a P2P session with
+the lobby's own session-listening port, not with the other real client
+- explaining the indefinite hang exactly. This confirms
+`docs/multi-peer-routing-design.md`'s per-pair-relay-port design is
+necessary, not just one plausible fix among others: a single shared
+public port structurally cannot distinguish clients at this protocol
+layer, no matter how the `0x29` rewrite itself is implemented.
+
+**Correction (2026-08-10): this was wrong - the new peer IS told about
+existing peers, just via a different, longer message than `0x29`.**
+Originally believed asymmetric based on a 31-byte address-free message
+(also `03 00`-wrapped, a `0x15`-length sub-payload of small integers,
+still undecoded - reads like a player-slot roster, not an address list)
+seen going to the newly-joining client at the same moment as the host's
+`0x29` broadcast to the existing peer. That 31-byte message is real, but
+it isn't the only thing the new peer receives: re-examining the archived
+2026-08-08 genuine 3-client capture
+(`archiving/sessions/20260808-234138-3client-p2p-check/host-capture.pcap`)
+turned up an **87-byte** settings-sync message, also `03 00`-wrapped,
+that the host sends the newly-joined peer shortly after - and it
+*does* embed the existing peer's real address:
+
+```
+03 00 <seq> <conn-id>              common wrapper (see above)
+4d 00                              unclear (length/flags?)
+15 02 00 00 00 ... (36 bytes)      unclear, no variable-length strings
+                                    observed - fixed-width, which is what
+                                    makes a fixed absolute-offset rewrite
+                                    safe here
+<sockaddr_in>                      existing peer's real address, at
+<sockaddr_in>                      absolute offsets 49 and 65 - duplicated,
+                                    same pattern as every other address
+                                    message
+02 00 00 00 00 00                  unclear trailer
+```
+
+The timing confirms it's not coincidental: in the archived capture, the
+new peer (clientb) sends its own outbound session-handshake to the
+existing peer (clienta) **~138ms after** receiving this 87-byte message
+- clearly reactive. Microsoft's official DirectPlay 8 Open Specification
+(`[MC-DPL8CS]` §3.1.5.2, "Peer-to-Peer Connect Sequence" - a *different*,
+later protocol than AoM's classic DirectPlay, but likely sharing the same
+conceptual design) independently predicts exactly this: `DN_INSTRUCT_CONNECT`
+is sent to **both** the new and existing peer, not just the existing one.
+See `docs/directplay8-packet-classification.md` for the full writeup and
+the official-spec cross-reference. Implemented in `lobby/main.go` as
+`existingPeerBroadcast`/`isExistingPeerBroadcast`/`rewriteExistingPeerBroadcast`,
+alongside the original `0x29` handling.
 
 **Scope note**: this project only ever hosts 1v1s (host in Observer Mode
 + exactly two real playing clients, per CLAUDE.md), so the maximum is 3

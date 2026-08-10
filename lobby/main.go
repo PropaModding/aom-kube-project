@@ -83,6 +83,162 @@ const (
 	sessionPeerOffset   = 24
 )
 
+// newPeerBroadcast is the settings-sync sub-message (nested inside the
+// 6-byte "03 00 <seq> <conn-id>" wrapper shared by that whole layer - see
+// docs/directplay8-protocol.md's "Post-handshake session-settings sync"
+// section) that the host sends to each already-connected peer whenever a
+// new peer joins, carrying the new peer's real address. Confirmed
+// 2026-08-08 (docs/directplay8-protocol.md's "Sessions are genuinely
+// peer-to-peer" section) as the one message that seeds every
+// peer-to-peer session - see docs/multi-peer-routing-design.md.
+//
+// Rewritten live (2026-08-10) to point at a dedicated A<->B pair relay
+// (see newPairRelay/matchState below) instead of just logged: confirmed
+// via a real proxied 2-client join test that leaving this unrewritten
+// embeds this proxy's own fixed session-port address
+// (cfg.publicIP:cfg.publicPort) for every client, because that's what
+// sessionProxy's existing "self" rewrite always substitutes regardless
+// of which real client sent the original packet - the backend can never
+// record a distinguishing address for any client under the old behavior,
+// so the existing peer was always being told to reconnect to the proxy
+// itself, not to the new peer. That's the root cause of the second
+// client's indefinite "Attempting to Connect" hang.
+//
+// Correction (2026-08-10): docs/directplay8-protocol.md describes this as
+// nested inside an "8-byte wrapper" and gives the sockaddr offsets (13,
+// 29) as relative to after that wrapper is stripped - but the wrapper it
+// actually diagrams is only 6 bytes (2-byte type + 2-byte seq + 2-byte
+// conn-id). Confirmed against a real captured packet (2026-08-10 2-client
+// join test): sub-type sits at absolute offset 6, and the doc's "13"/"29"
+// are already absolute packet offsets, not relative to a stripped 8-byte
+// wrapper - the doc's own parenthetical about the 8-byte wrapper is the
+// part that's wrong.
+const (
+	newPeerWrapperType0  = 0x03
+	newPeerWrapperType1  = 0x00
+	newPeerSubType0      = 0x29
+	newPeerSubType1      = 0x00
+	newPeerSubTypeOffset = 6 // right after the 6-byte 03 00/seq/conn-id wrapper
+
+	// Absolute offsets into the raw packet of the two back-to-back
+	// sockaddr_in blocks carrying the new peer's address - see the
+	// correction above.
+	newPeerAddrOffset1 = 13
+	newPeerAddrOffset2 = 29
+
+	// Minimum length to safely read the sub-type tag and both sockaddr_in
+	// blocks without a short-packet panic.
+	newPeerBroadcastMinLen = newPeerAddrOffset2 + sockaddrLen
+)
+
+// isNewPeerBroadcast reports whether payload is a session-port (0x03
+// wrapper) settings-sync message with the nested 0x29 sub-type - see
+// newPeerBroadcast above.
+func isNewPeerBroadcast(payload []byte) bool {
+	if len(payload) < newPeerBroadcastMinLen {
+		return false
+	}
+	return payload[0] == newPeerWrapperType0 && payload[1] == newPeerWrapperType1 &&
+		payload[newPeerSubTypeOffset] == newPeerSubType0 && payload[newPeerSubTypeOffset+1] == newPeerSubType1
+}
+
+// sockaddrInAddr reads the sin_port/sin_addr fields (big-endian, matching
+// rewriteSessionField's write side) out of the sockaddr_in block at
+// offset, for logging purposes only.
+func sockaddrInAddr(payload []byte, offset int) (net.IP, uint16) {
+	port := binary.BigEndian.Uint16(payload[offset+2 : offset+4])
+	ip := net.IP(append([]byte(nil), payload[offset+4:offset+8]...))
+	return ip, port
+}
+
+// rewriteNewPeerBroadcast overwrites both embedded sockaddr_in blocks in a
+// detected 0x29 broadcast with relayIP:relayPort - the dedicated A<->B
+// pair relay's own address (see newPairRelay) - so the existing peer
+// dials the relay instead of whatever address the backend actually
+// recorded for the new peer (which, per newPeerBroadcast's doc comment,
+// is never usable directly).
+func rewriteNewPeerBroadcast(payload []byte, relayIP [4]byte, relayPort uint16) []byte {
+	out := rewriteSessionField(payload, newPeerAddrOffset1, relayIP, relayPort)
+	return rewriteSessionField(out, newPeerAddrOffset2, relayIP, relayPort)
+}
+
+// existingPeerBroadcast is the settings-sync sub-message counterpart to
+// newPeerBroadcast above, going the *other* direction: the host sends
+// this to a *newly-joined* peer (B), telling it the real address of an
+// *already-connected* peer (A) - the piece that was missing entirely
+// until 2026-08-10. Earlier notes (docs/directplay8-protocol.md's
+// "Sessions are genuinely peer-to-peer" section, 2026-08-08) concluded
+// "the new peer is never told about existing peers... it just listens" -
+// that was wrong, or at least incomplete: this message was missed
+// because it doesn't share newPeerBroadcast's shape (87 bytes here vs 51
+// for 0x29, and a longer, still-unclear header before the address), not
+// because it doesn't exist. Found by re-examining the archived
+// 2026-08-08 genuine 3-client capture
+// (archiving/sessions/20260808-234138-3client-p2p-check/host-capture.pcap):
+// B receives this from the host ~138ms before B sends its own outbound
+// session-handshake to A - clearly reactive, not coincidental.
+//
+// Confirmed shape (host->B, 87 bytes total):
+//
+//	03 00 <seq> <conn-id>              common wrapper (see newPeerBroadcast)
+//	4d 00                              unclear (length/flags? matches remaining-byte-count loosely)
+//	15 02 00 00 00 ... (36 bytes)      unclear, no variable-length strings observed -
+//	                                    fixed-width, unlike the player-announce/map-name
+//	                                    sub-messages, which is what makes a fixed
+//	                                    absolute-offset rewrite safe here
+//	<sockaddr_in>                      existing peer's (A's) real address, at
+//	<sockaddr_in>                      absolute offsets 49 and 65 - duplicated,
+//	                                    same pattern as every other address message
+//	02 00 00 00 00 00                  unclear trailer
+//
+// Not yet re-decoded against a fresh capture with this understanding in
+// hand - the sub-type/length markers above are best-effort labels, not
+// confirmed semantics. What's confirmed is the address offsets and the
+// 87-byte total length, both directly measured from the real packet.
+const (
+	existingPeerWrapperType0 = 0x03
+	existingPeerWrapperType1 = 0x00
+
+	// Absolute offsets into the raw packet of the two back-to-back
+	// sockaddr_in blocks carrying the existing peer's address.
+	existingPeerAddrOffset1 = 49
+	existingPeerAddrOffset2 = 65
+
+	// Exact length rather than a minimum: unlike newPeerBroadcast, this
+	// message has no observed variable-length fields (no nickname/session
+	// name), so 87 bytes appears to be constant - matched exactly here to
+	// keep the false-positive rate low given the offset/subtype semantics
+	// above aren't fully understood yet. Revisit if a real capture ever
+	// shows a same-shaped message at a different length.
+	existingPeerBroadcastLen = 87
+)
+
+// isExistingPeerBroadcast reports whether payload is a session-port
+// (0x03 wrapper) settings-sync message matching existingPeerBroadcast's
+// shape above. The length match already does most of the work; the
+// sockaddr sin_family sanity check (mirroring isSessionHandshake) guards
+// against the remaining risk of a same-length gameplay/tick packet
+// coincidentally matching.
+func isExistingPeerBroadcast(payload []byte) bool {
+	if len(payload) != existingPeerBroadcastLen {
+		return false
+	}
+	if payload[0] != existingPeerWrapperType0 || payload[1] != existingPeerWrapperType1 {
+		return false
+	}
+	return binary.LittleEndian.Uint16(payload[existingPeerAddrOffset1:existingPeerAddrOffset1+2]) == 2 &&
+		binary.LittleEndian.Uint16(payload[existingPeerAddrOffset2:existingPeerAddrOffset2+2]) == 2
+}
+
+// rewriteExistingPeerBroadcast overwrites both embedded sockaddr_in
+// blocks in a detected existingPeerBroadcast message with
+// relayIP:relayPort - see rewriteNewPeerBroadcast, same mechanism,
+// different offsets.
+func rewriteExistingPeerBroadcast(payload []byte, relayIP [4]byte, relayPort uint16) []byte {
+	out := rewriteSessionField(payload, existingPeerAddrOffset1, relayIP, relayPort)
+	return rewriteSessionField(out, existingPeerAddrOffset2, relayIP, relayPort)
+}
+
 func isSessionHandshake(payload []byte) bool {
 	if len(payload) != sessionHandshakeLen {
 		return false
@@ -394,6 +550,29 @@ func (p *proxy) anySessionClientAddr() *net.UDPAddr {
 	return nil
 }
 
+// otherSessionClientAddr returns the real address of the one session in
+// p.sessions besides skip - used by the 0x29 new-peer-broadcast rewrite to
+// find the newly-joined peer's real address from sessionProxy's own
+// session map, since the broadcast's own embedded address is never
+// usable directly (see newPeerBroadcast's doc comment). Safe to assume at
+// most one "other" session exists: this project only ever hosts 1v1s
+// (host + exactly two real clients, see CLAUDE.md's Goals), so besides
+// skip there's never more than one candidate.
+func (p *proxy) otherSessionClientAddr(skip *net.UDPAddr) *net.UDPAddr {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, sess := range p.sessions {
+		if sess.clientAddr == nil {
+			continue
+		}
+		if sess.clientAddr.IP.Equal(skip.IP) && sess.clientAddr.Port == skip.Port {
+			continue
+		}
+		return sess.clientAddr
+	}
+	return nil
+}
+
 // relayBackendInitiated handles a packet the backend sent unprompted to
 // this proxy's listening socket (rather than as a reply on a per-client
 // dialed connection) - see clientTracker's doc comment for why the backend
@@ -557,6 +736,146 @@ func mustListen(addr string) *net.UDPConn {
 	return conn
 }
 
+// pairRelay bridges exactly two real, already-known client addresses
+// directly - the A<->B leg of a match that sessionProxy alone can't
+// provide, since sessionProxy's single shared port only ever bridges a
+// client to the fixed AoM backend. See
+// docs/multi-peer-routing-design.md's "one dedicated relay port per
+// pair" section.
+//
+// This is deliberately NOT built by reusing the proxy struct above.
+// proxy's model is asymmetric by design - one fixed backend, clients
+// learned dynamically from whoever calls in - which fits client<->host
+// (there's genuinely only one backend) but not client<->client, where
+// BOTH sides are real, already-known endpoints and BOTH sides' traffic
+// arrives on the same shared listening socket (see the doc comment on
+// isSessionHandshake's "self" field: the receiver trusts the payload's
+// embedded address for where to send future traffic, not the raw UDP
+// source port, so both A and B end up addressing the relay's one shared
+// port symmetrically). A first attempt reusing proxy here (2026-08-10)
+// confirmed this the hard way: B's own replies landed on the shared
+// listening socket, didn't match A's session key, and got misdiagnosed
+// as "a new client" trying to reach backendAddr - which was ALSO B,
+// producing a self-referential dial (B "connecting to" B) that failed
+// immediately and repeated in a tight create/fail/retry loop. Since both
+// real addresses are already known up front here (unlike client<->host,
+// where the client is discovered dynamically), there's no need for
+// proxy's per-client session/dial machinery at all - just a fixed
+// two-way address switch.
+type pairRelay struct {
+	name string
+	cfg  config
+	conn *net.UDPConn
+	// selfPort is conn's own bound port, embedded in the "self" field of
+	// every session-handshake packet relayed through here (both
+	// directions use the same relay port, unlike proxy's per-direction
+	// dial-vs-listen split - see the type doc comment).
+	selfPort uint16
+	addrA    *net.UDPAddr
+	addrB    *net.UDPAddr
+}
+
+// newPairRelay binds a fresh, dynamically-allocated port (never the
+// fixed shared session port - reusing that would reproduce the exact bug
+// this relay exists to fix, see newPeerBroadcast's doc comment) and
+// starts relaying between addrA and addrB.
+func newPairRelay(name string, cfg config, addrA, addrB *net.UDPAddr) *pairRelay {
+	conn := mustListen(":0")
+	r := &pairRelay{
+		name:     name,
+		cfg:      cfg,
+		conn:     conn,
+		selfPort: uint16(conn.LocalAddr().(*net.UDPAddr).Port),
+		addrA:    addrA,
+		addrB:    addrB,
+	}
+	log.Printf("[%s] new A<->B pair relay on %s:%d, bridging %s <-> %s", name, net.IP(cfg.publicIP[:]), r.selfPort, addrA, addrB)
+	return r
+}
+
+func udpAddrEqual(a, b *net.UDPAddr) bool {
+	return a.IP.Equal(b.IP) && a.Port == b.Port
+}
+
+// run reads every packet arriving on this relay's shared socket and
+// forwards it to whichever of addrA/addrB ISN'T the sender - rewriting
+// the session handshake's self/peer fields the same way sessionProxy
+// does (self -> this relay's own address, so the receiver replies
+// through the relay; peer -> the receiver's own real address, matching
+// what its own validation expects, per isSessionHandshake's doc comment)
+// - every other message type passes through unmodified.
+func (r *pairRelay) run() {
+	buf := make([]byte, bufSize)
+	for {
+		n, src, err := r.conn.ReadFromUDP(buf)
+		if err != nil {
+			log.Printf("[%s] read: %v", r.name, err)
+			continue
+		}
+		payload := append([]byte(nil), buf[:n]...)
+
+		var dst *net.UDPAddr
+		switch {
+		case udpAddrEqual(src, r.addrA):
+			dst = r.addrB
+		case udpAddrEqual(src, r.addrB):
+			dst = r.addrA
+		default:
+			log.Printf("[%s] packet from unexpected sender %s (expected %s or %s), dropping", r.name, src, r.addrA, r.addrB)
+			continue
+		}
+
+		out := payload
+		if isSessionHandshake(payload) {
+			var dstIP [4]byte
+			copy(dstIP[:], dst.IP.To4())
+			out = rewriteSessionField(payload, sessionSelfOffset, r.cfg.publicIP, r.selfPort)
+			out = rewriteSessionField(out, sessionPeerOffset, dstIP, uint16(dst.Port))
+		}
+		if _, err := r.conn.WriteToUDP(out, dst); err != nil {
+			log.Printf("[%s] write to %s: %v", r.name, dst, err)
+		}
+	}
+}
+
+// matchState holds the one A<->B pair relay this proxy currently needs.
+// This project only ever hosts 1v1s (host + exactly two real clients, see
+// CLAUDE.md's Goals), so there's at most one such pairing active at a
+// time - no need for a keyed collection of matches yet (see
+// docs/multi-peer-routing-design.md's "Open questions" on multiple
+// concurrent matches, which is explicitly out of scope for now).
+type matchState struct {
+	cfg config
+
+	mu   sync.Mutex
+	pair *pairRelay
+}
+
+// ensurePairRelay returns the A<->B relay for this match, creating and
+// starting it on first use. selfAddr is the existing peer receiving the
+// 0x29 broadcast (A); otherAddr is the newly-joined peer it just learned
+// about (B) - see sessionProxy's rewriteToClient closure in main(), which
+// calls this upon detecting that broadcast. Both real addresses are
+// already known at this point (see pairRelay's doc comment for why that
+// matters), so the relay can be built directly with no per-client
+// discovery step.
+//
+// Not yet handled (see docs/multi-peer-routing-design.md's "Durability"
+// section): tearing this down when a player drops and rebuilding it for
+// whoever joins the vacated slot - today it's created once per proxy
+// lifetime and never replaced.
+func (m *matchState) ensurePairRelay(selfAddr, otherAddr *net.UDPAddr) *pairRelay {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pair != nil {
+		return m.pair
+	}
+	relay := newPairRelay("pair", m.cfg, selfAddr, otherAddr)
+	go relay.run()
+	m.pair = relay
+	return relay
+}
+
 func main() {
 	cfg := loadConfig()
 
@@ -604,7 +923,15 @@ func main() {
 		log.Fatalf("resolving SESSION_BACKEND_ADDR %q: %v", cfg.sessionBackendAddr, err)
 	}
 
-	sessionProxy := &proxy{
+	// The A<->B pair relay (see matchState/newPairRelay above) is created
+	// lazily from inside sessionProxy's own rewriteToClient closure below,
+	// which needs to look itself up (to find the newly-joined peer's real
+	// address via otherSessionClientAddr) - hence declaring the variable
+	// before the struct literal that closes over it, rather than the usual
+	// := form.
+	match := &matchState{cfg: cfg}
+	var sessionProxy *proxy
+	sessionProxy = &proxy{
 		name:           "session",
 		cfg:            cfg,
 		clientConn:     mustListen(cfg.sessionListenAddr),
@@ -631,6 +958,39 @@ func main() {
 			return out
 		},
 		rewriteToClient: func(payload []byte, cfg config, sess *session) []byte {
+			if isNewPeerBroadcast(payload) {
+				other := sessionProxy.otherSessionClientAddr(sess.clientAddr)
+				if other == nil {
+					log.Printf("[session] 0x29 new-peer broadcast to client %s but no other real client session found yet, forwarding unmodified", sess.clientAddr)
+					return payload
+				}
+				relay := match.ensurePairRelay(sess.clientAddr, other)
+				out := rewriteNewPeerBroadcast(payload, cfg.publicIP, relay.selfPort)
+				origIP, origPort := sockaddrInAddr(payload, newPeerAddrOffset1)
+				log.Printf("[session] rewrote 0x29 new-peer broadcast to client %s: %s:%d -> relay %s:%d",
+					sess.clientAddr, origIP, origPort, net.IP(cfg.publicIP[:]), relay.selfPort)
+				return out
+			}
+			if isExistingPeerBroadcast(payload) {
+				// Mirror image of the 0x29 branch above: this client (sess,
+				// the newly-joined one) is being told an *existing* peer's
+				// address - see existingPeerBroadcast's doc comment.
+				// ensurePairRelay/otherSessionClientAddr are already
+				// symmetric in self/other, so whichever of the two
+				// broadcasts arrives first creates the relay and the other
+				// just reuses it.
+				other := sessionProxy.otherSessionClientAddr(sess.clientAddr)
+				if other == nil {
+					log.Printf("[session] existing-peer broadcast to client %s but no other real client session found yet, forwarding unmodified", sess.clientAddr)
+					return payload
+				}
+				relay := match.ensurePairRelay(sess.clientAddr, other)
+				out := rewriteExistingPeerBroadcast(payload, cfg.publicIP, relay.selfPort)
+				origIP, origPort := sockaddrInAddr(payload, existingPeerAddrOffset1)
+				log.Printf("[session] rewrote existing-peer broadcast to client %s: %s:%d -> relay %s:%d",
+					sess.clientAddr, origIP, origPort, net.IP(cfg.publicIP[:]), relay.selfPort)
+				return out
+			}
 			if !isSessionHandshake(payload) {
 				if cfg.verbose {
 					log.Printf("[session] backend->client non-handshake (%d bytes): %s", len(payload), hex.EncodeToString(payload))

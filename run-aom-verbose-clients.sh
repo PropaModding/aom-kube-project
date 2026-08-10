@@ -51,7 +51,25 @@ WORKDIR="${WORKDIR:-/tmp/aom-verbose-clients}"
 # provider (+dpwsockx), the newer DirectPlay8 API in case any of it is
 # used (+dpnet), and the raw sockets layer everything ultimately rides on
 # (+winsock/+ws2_32).
-WINEDEBUG_CHANNELS="${WINEDEBUG_CHANNELS:-+dpwsockx,+dplay,+dplaysvc,+dpnet,+winsock,+ws2_32}"
+#
+# FULL_RELAY_TRACE=1 adds Wine's +relay channel - full Win32 API call
+# tracing, including actual connect()/bind() calls and their arguments,
+# which +winsock's own WS2_* logging doesn't surface on its own. Off by
+# default: this is the exact overhead run-aom-lobby's own VERBOSE flag
+# doc comment and this script's header both warn can distort a
+# genuinely-completing connection's timing, and unlike
+# run-aom-spoofed-client.sh (poking at an already-broken proxied
+# attempt), this script's whole point is capturing a real *working*
+# connection - so leave it off unless you're specifically trying to
+# answer a question +relay is needed for, e.g. whether the client's
+# session socket ever calls connect() at all (see the 2026-08-10
+# multi-peer-routing debugging session, where the proxied side never
+# showed one under the plain WS2_* channels).
+if [ "${FULL_RELAY_TRACE:-}" = "1" ]; then
+    WINEDEBUG_CHANNELS="${WINEDEBUG_CHANNELS:-+timestamp,+relay,+dpwsockx,+dplay,+dplaysvc,+dpnet,+winsock,+ws2_32}"
+else
+    WINEDEBUG_CHANNELS="${WINEDEBUG_CHANNELS:-+timestamp,+dpwsockx,+dplay,+dplaysvc,+dpnet,+winsock,+ws2_32}"
+fi
 
 mkdir -p "$WORKDIR"
 

@@ -20,10 +20,10 @@ spec:
         app: aom-headless
     spec:
       # No hostNetwork here anymore: the node's real 2299/2300 now belong to
-      # aom-lobby and quilkin (see k8s/lobby-deployment.yaml and
-      # k8s/quilkin-deployment.yaml), which sit in front of this pod and
-      # rewrite/relay traffic to it via the aom-headless-game Service below.
-      # This pod only needs a normal, in-cluster pod IP.
+      # aom-lobby (see k8s/lobby-deployment.yaml), which sits in front of
+      # this pod and rewrites/relays traffic to it via the
+      # aom-headless-game Service below. This pod only needs a normal,
+      # in-cluster pod IP.
       containers:
         - name: aom
           image: aom-k8s:latest
@@ -67,7 +67,7 @@ spec:
   type: ClusterIP
 ---
 # Stable in-cluster address for the real pod's DirectPlay8 ports, so
-# aom-lobby and quilkin don't have to chase pod IPs across restarts.
+# aom-lobby doesn't have to chase pod IPs across restarts.
 apiVersion: v1
 kind: Service
 metadata:

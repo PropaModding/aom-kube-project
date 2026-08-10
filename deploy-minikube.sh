@@ -2,8 +2,8 @@
 # Builds the headless AoM image and the aom-lobby image straight into
 # minikube's own Docker daemon (no registry involved, matches
 # imagePullPolicy: Never in the k8s manifests) and applies the host
-# (aom-headless), client (aom-client), lobby (aom-lobby), and quilkin
-# manifests from k8s/. Re-run any time dockerfile.k8s, dockerfile.lobby,
+# (aom-headless), client (aom-client), and lobby (aom-lobby) manifests
+# from k8s/. Re-run any time dockerfile.k8s, dockerfile.lobby,
 # entrypoint.sh, or the k8s manifests change.
 #
 # Usage: ./deploy-minikube.sh
@@ -31,14 +31,11 @@ echo "[*] Applying k8s manifests..."
 kubectl apply -f "$SCRIPT_DIR/k8s/aom-headless-deployment.yaml"
 kubectl apply -f "$SCRIPT_DIR/k8s/aom-client-deployment.yaml"
 kubectl apply -f "$SCRIPT_DIR/k8s/lobby-deployment.yaml"
-kubectl apply -f "$SCRIPT_DIR/k8s/quilkin-deployment.yaml"
 
 echo "[*] Waiting for rollout..."
 kubectl rollout status deployment/aom-headless --timeout=180s
 kubectl rollout status deployment/aom-client --timeout=180s
 kubectl rollout status deployment/aom-lobby --timeout=60s
-# quilkin is parked at replicas: 0 for now (see k8s/quilkin-deployment.yaml)
-# - nothing to configure or wait on until it's scaled back up.
 
 MINIKUBE_IP="$(minikube ip)"
 echo "[*] Pointing aom-lobby at this cluster's real address ($MINIKUBE_IP)..."

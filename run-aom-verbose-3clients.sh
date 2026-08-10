@@ -65,7 +65,21 @@ DOCKER_NETWORK="${DOCKER_NETWORK:-minikube}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 WORKDIR="${WORKDIR:-$SCRIPT_DIR/archiving/sessions/$(date +%Y%m%d-%H%M%S)-3client-p2p-check}"
 
-WINEDEBUG_CHANNELS="${WINEDEBUG_CHANNELS:-+dpwsockx,+dplay,+dplaysvc,+dplayx,+dpnet,+winsock,+ws2_32}"
+# FULL_RELAY_TRACE=1 adds Wine's +relay channel - full Win32 API call
+# tracing, including actual connect()/bind() calls and their arguments,
+# which the WS2_* logging from +winsock alone doesn't surface. Off by
+# default per this script's own header comment on why +relay was
+# deliberately excluded (timing distortion risk on a genuinely-completing
+# connection) - turn on when specifically chasing a question only +relay
+# can answer, e.g. whether the client<->client session socket ever calls
+# connect() at all (see the 2026-08-10 multi-peer-routing debugging
+# session, where a proxied attempt's WS2_* channels alone never logged
+# one, leaving that open).
+if [ "${FULL_RELAY_TRACE:-}" = "1" ]; then
+    WINEDEBUG_CHANNELS="${WINEDEBUG_CHANNELS:-+timestamp,+relay,+dpwsockx,+dplay,+dplaysvc,+dplayx,+dpnet,+winsock,+ws2_32}"
+else
+    WINEDEBUG_CHANNELS="${WINEDEBUG_CHANNELS:-+timestamp,+dpwsockx,+dplay,+dplaysvc,+dplayx,+dpnet,+winsock,+ws2_32}"
+fi
 
 mkdir -p "$WORKDIR"
 

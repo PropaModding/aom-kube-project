@@ -6,20 +6,19 @@ spoofing DirectPlay 8 packets to support modern multiplayer hosting environments
 
 ## Stack
 - Docker / docker-compose
-- Quilkin (UDP proxy)
 - Bash scripts (run-aom-head.sh)
 
 ## Key files
 - `dockerfile.k8s` — headless AoM game pod image (no GPU/host X11/PulseAudio)
 - `dockerfile.lobby` — the Go lobby image
 - `lobby/` — the Go lobby: fake matchmaking front-end (see Architecture)
-- `quilkin/` — Quilkin proxy config
 - `k8s/` — Deployment/Service manifests for all of the above
 - `deploy-minikube.sh` — builds/applies everything into a local minikube cluster
 - `docs/directplay8-protocol.md` — reverse-engineered wire protocol findings
 - `docs/lobby-status-api.md` — `aom-lobby`'s `GET /hosts`/`GET /waiting` status endpoints
 - `docs/host-flow.md` — driving `aom-headless` from cold pod to hosted lobby via `xdotool`/VNC calibration
-- `docs/multi-peer-routing-design.md` — design (not yet implemented) for routing a full 1v1 match, not just client↔host — see Architecture intention below
+- `docs/multi-peer-routing-design.md` — design + implementation notes for routing a full 1v1 match (not just client↔host), implemented 2026-08-10 — see Architecture intention below
+- `docs/directplay8-packet-classification.md` — classification reference cross-checking our reverse-engineered packets against the official DirectPlay 8 Open Specifications, plus a list of confirmed vs. still-open message types for the next capture
 - `host-game-kube.sh` — automates hosting a game on `aom-headless` (EULA → menus → lobby, Players set to 3)
 - `run-aom-spoofed-client.sh` — one "second PC" container for testing Direct-Connect against the cluster
 - `run-aom-verbose-clients.sh` — two spoofed clients (host + 1 joiner) joining directly (no lobby/proxy), with full WINEDEBUG + in-container tcpdump byte capture, for diffing a genuinely successful connection against a failing proxied one
@@ -57,17 +56,22 @@ cluster's public address) — not LAN browsing. There is no pre-existing
   the k8s API, then hands the client off to whichever pod is theirs.
 - **Pods are per-match and on-demand**, not a pre-warmed fixed pool —
   created when a match is actually forming, torn down when it ends.
-- **Quilkin routes the actual UDP 2300 session traffic to the correct
-  pod** per client/match, using its Token Router + Capture filters (a
-  per-match token, not a single static endpoint like the current
-  implementation) rather than Quilkin forwarding to one fixed backend.
-  This requires Quilkin's dynamic config (filesystem or xDS provider, not
-  the static `quilkin.yaml` used for the first pass) so the lobby can push
-  endpoint/token updates as matches come and go.
+- **`aom-lobby` itself needs to route the actual UDP 2300 session traffic
+  to the correct pod per client/match**, not just the single static
+  backend (`SESSION_BACKEND_ADDR`) it's hardcoded to today. Open
+  question, not yet designed: Quilkin was originally slated to own this
+  (Token Router + Capture filters, per-match token, dynamic xDS/filesystem
+  config) but was ripped out 2026-08-10 as dead weight — it never got
+  past a parked, unused `replicas: 0` deployment, since the client↔client
+  routing problem turned out to be the actually-blocking one (see the
+  next section) and got solved directly inside `aom-lobby` instead (the
+  `pairRelay`/dynamic-port pattern in `lobby/main.go`). The same
+  per-match dynamic-port approach is the likely shape for multi-backend-pod
+  routing too, once it's needed - no plan to reintroduce Quilkin.
 
 This is a substantial step up from the first working version (single
-always-on pod, static Quilkin config) — treat that version as the
-groundwork, not the end state.
+always-on pod, static backend) — treat that version as the groundwork,
+not the end state.
 
 ### Sessions are peer-to-peer, not host-relayed — the proxy has to route a whole match, not just client↔host
 

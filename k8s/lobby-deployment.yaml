@@ -8,11 +8,6 @@
 # lobby/main.go and docs/directplay8-protocol.md for why 2300 needs this
 # too, not just 2299).
 #
-# Quilkin is currently parked (see quilkin-deployment.yaml) - with a
-# single static backend pod it wasn't earning its keep, so the lobby
-# relays 2300 straight to aom-headless-game itself for now. Quilkin comes
-# back once there's more than one backend pod to route between.
-#
 # PUBLIC_ADDR isn't known until the cluster exists (it's the minikube
 # node's own IP) — deploy-minikube.sh patches it in after apply.
 #

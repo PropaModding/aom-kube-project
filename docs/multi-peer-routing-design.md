@@ -1,8 +1,17 @@
 # Multi-peer routing design: making aom-lobby route a full 1v1 match
 
-**Status: design only, not yet implemented.** Written 2026-08-08 end of
-session, for picking back up fresh. Nothing in this doc is code - it's
-the plan, the evidence behind it, and what to verify along the way.
+**Status (2026-08-10): implemented and confirmed working.** Originally
+written 2026-08-08 as design-only. `lobby/main.go` now has the per-pair
+relay (`pairRelay`/`newPairRelay`/`matchState`) and both rewrite
+directions (`0x29` for the existing peer, `existingPeerBroadcast` for the
+new peer - see the "asymmetric" correction below, that assumption turned
+out to be wrong). Verified end to end through a real 2-client join
+against the cluster: both clients connect, see each other, and exchange
+chat. Durability (resign detection, scoped teardown, clean re-fill on a
+dropped player, see that section below) is still not implemented - the
+rest of this doc's content is otherwise accurate to what got built,
+kept as-is below as the design record rather than rewritten after the
+fact.
 
 ## The problem
 
@@ -45,12 +54,17 @@ already rewrites `0x26`/`0x21`/`0x20`, and the proxy fully controls which
 address each client tries to open a session with next. Exact byte
 offsets are in `docs/directplay8-protocol.md`.
 
-Confirmed asymmetric: only the *existing* peer gets this broadcast. The
-*new* peer gets a different, address-free message instead, and simply
-learns the existing peer's address passively (from the source address of
-that peer's incoming, proactively-sent `type 0x00`) - the same pattern
-already implemented for the client↔host handshake. So there's exactly one
-new rewrite rule needed to seed the whole thing, not two.
+**Correction (2026-08-10): not asymmetric after all.** Originally
+believed only the *existing* peer gets a broadcast and the *new* peer
+just listens passively. Wrong - the new peer gets its own, different
+(87-byte, not 51-byte) address-carrying message, found by re-examining
+the archived genuine capture. Both directions needed rewriting, not one
+- see `docs/directplay8-protocol.md`'s correction note and
+`docs/directplay8-packet-classification.md` for the full byte-level
+writeup. Implemented as two parallel code paths in `lobby/main.go`
+(`newPeerBroadcast` for the existing-peer-facing one, `existingPeerBroadcast`
+for the new-peer-facing one), both converging on the same lazily-created
+`pairRelay` via `matchState.ensurePairRelay`'s idempotent creation.
 
 ## Proposed architecture: one dedicated relay port per pair
 
@@ -164,20 +178,66 @@ this falls out of the per-pair design rather than needing new machinery.
 - Voobly is still completely out of scope here - nothing in this design
   is assumed to transfer to it (see CLAUDE.md).
 
-## Suggested order of work (next session)
+## Suggested order of work (2026-08-08 plan - superseded, kept for record)
 
-1. Reference capture of the drop/rejoin sequence (see above) - cheap
-   insurance against building teardown logic against assumptions instead
-   of evidence.
-2. Extend `lobby/main.go`'s rewrite dispatch to support the nested
-   `0x03`/`0x29` lookup, still just logging what it *would* rewrite to
-   (mirrors how `VERBOSE` logging was used to validate earlier fixes
-   before wiring them live).
-3. Build the per-pair relay type by generalizing today's `proxy` struct,
-   prove it against the existing host↔client relationship first (should
-   be a no-op refactor, easy to verify against the already-working
-   single-client path).
-4. Wire up A↔B using the `0x29` rewrite to seed it, test against the
-   real 2-client scenario from earlier today.
-5. Layer in durability (resign detection, scoped teardown, re-fill) once
-   the base 3-pair routing is confirmed working.
+1. ~~Reference capture of the drop/rejoin sequence~~ - skipped; durability
+   still not built (see below), the base routing got proven with live
+   traffic diffing instead once the second rewrite gap was found.
+2. ~~Extend `lobby/main.go`'s rewrite dispatch to support the nested
+   `0x03`/`0x29` lookup, log-only first~~ - done 2026-08-10.
+3. ~~Build the per-pair relay type~~ - done 2026-08-10, but *not* as a
+   generalization of the existing `proxy` struct as originally planned
+   here - `proxy`'s asymmetric one-fixed-backend model doesn't fit a
+   symmetric two-real-peer relationship (confirmed by a first attempt
+   that crash-looped). Built as a new, dedicated `pairRelay` type
+   instead - see the correction note above.
+4. ~~Wire up A↔B using the `0x29` rewrite~~ - done, plus a second rewrite
+   for the new-peer-facing direction that this plan didn't know existed
+   yet (see the "not asymmetric after all" correction above).
+5. Durability (resign detection, scoped teardown, re-fill) - **still not
+   done**, see "Next steps" below.
+
+## Next steps (2026-08-10)
+
+Base P2P routing is done and confirmed working (real 2-client join,
+both directions, chat verified). Queued for next session, roughly in
+priority order:
+
+1. **Lobby-status endpoint for "fully staffed"**: extend the existing
+   `GET /hosts`/`GET /waiting` HTTP status endpoints (see
+   `docs/lobby-status-api.md`, `lobby/main.go`'s `hostProbe`) with a way
+   to report "this host has a full lobby" (host + 2 real clients, no
+   open slots) - needed by whatever automates provisioning/routing new
+   Direct-Connects into existing vs. new matches per CLAUDE.md's
+   Architecture intention.
+2. **Auto Observer Mode**: `host-game-kube.sh` currently requires a
+   manual click on Observer Mode once both real clients have joined (see
+   `docs/host-flow.md`) - automate that transition (probably driven by
+   the same "2 real clients connected" signal as item 1).
+   **Simplified by a 2026-08-10 manual-testing observation**: once a host
+   fills both slots (in whatever order/fashion) it appears to *stay* in
+   Observer Mode from then on, including through a later drop/rejoin -
+   i.e. this doesn't need to be a dynamic "detect 2 clients, click
+   Observer Mode, detect a drop, click it again" state machine. It might
+   be enough to just click Observer Mode **once**, possibly even as part
+   of the pod's initial startup sequence before any real client has
+   joined at all - worth trying that first, since it would also make
+   item 4's durability work simpler (no Observer Mode re-swap logic
+   needed on reconnect). Not yet verified rigorously - the "stays in
+   Observer Mode" claim is from informal testing, not a captured/confirmed
+   behavior.
+3. **Ready-up automation**: figure out what packet(s) signal both real
+   players have hit Ready, and drive the host's own response
+   automatically via `xdotool` from inside the container - packet-driven
+   preferred over polling/screenshotting, so this needs its own
+   reverse-engineering pass first (same method as everything else in
+   `docs/directplay8-protocol.md`: diff a genuine ready-up capture).
+4. **Durability**: a client drops mid-match, a new client joins the
+   vacated slot - the original "Durability" section above still describes
+   the design (resign-signal detection + existing idle-timeout reap,
+   scoped teardown, clean re-fill), none of it built yet. Needs the
+   reference drop/rejoin capture this doc originally called for in step 1
+   above, still not taken. Per item 2's observation, may **not** need an
+   Observer Mode re-swap step if Observer Mode really does persist through
+   a drop/rejoin - re-verify that assumption before building any re-swap
+   logic on the strength of it.
