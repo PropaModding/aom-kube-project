@@ -14,12 +14,11 @@
 #   the lobby's own player list while debugging. e.g. ./host-game-kube.sh TheIP
 #
 # Leaves the pod sitting in the hosted lobby (game name "<nickname>'s
-# Game", default map/settings). Does NOT click "Observer Mode" - that
-# needs to happen only after a real client has joined (see
-# docs/host-flow.md's "Switching to Observer Mode" section), which this
-# script doesn't attempt to detect. Not started here either: this only
-# gets the lobby open for players to join, same as the manual VNC flow
-# would.
+# Game", default map/settings), host already in Observer Mode with both
+# slots open for real clients - see docs/host-flow.md for how the
+# AI-fill/Observer-Mode/kick sequence was calibrated. Not started here
+# either: this only gets the lobby open for players to join, same as the
+# manual VNC flow would.
 #
 # Assumes the pod is fresh (just past the game window appearing) or at
 # worst already sitting at the real Main Menu - after the EULA, the intro
@@ -155,21 +154,37 @@ echo "[*] click (55, 74) - select 3 Players"
 xdo mousemove 55 74 click 1
 sleep "$STEP_DELAY"
 
-# --- Observer Mode: NOT yet automated here. Confirmed 2026-08-11 that
-# the checkbox at (178, 563) works and sticks once both real clients have
-# already joined (docs/host-flow.md). Clicking it earlier - right after
-# selecting 3 Players, while both slots still say "Open" - is suspected
-# NOT to work as-is: AoM's lobby reportedly requires both slots to be
-# filled (with AI, via clicking each "Open" slot) before Observer Mode
-# can be set, with a separate "shoe icon" per-slot control to kick an AI
-# player back out once a real client is ready to Direct-Connect into that
-# slot. Coordinates for both the AI-fill click and the shoe-icon kick
-# aren't calibrated yet - see docs/host-flow.md's "Still to do". Until
-# that's done, this script leaves Observer Mode for a manual/live-debug
-# click same as before.
+# --- Observer Mode: fill both "Open" slots with Standard AI first, then
+# set Observer Mode, then kick both AI back out to leave the slots open
+# for real clients - calibrated live 2026-08-11 (docs/host-flow.md).
+# AoM's lobby requires both slots filled before Observer Mode can be set
+# at all; the "shoe icon" kick control (confirmed to work identically on
+# an AI or a real player - tested by kicking a real connected client
+# live) is what reopens a slot afterward without disturbing Observer
+# Mode. Each slot's dropdown opens anchored at the slot's own row, with
+# "Standard" the option immediately below "Open" (13px per row, same
+# spacing as the Players dropdown above) - click 1 opens it, click 2
+# selects "Standard".
+echo "[*] click (100, 115) - open slot 2 dropdown"
+xdo mousemove 100 115 click 1
+sleep 1
+echo "[*] click (75, 128) - select Standard AI for slot 2"
+xdo mousemove 75 128 click 1
+sleep "$STEP_DELAY"
+
+echo "[*] click (100, 143) - open slot 3 dropdown"
+xdo mousemove 100 143 click 1
+sleep 1
+echo "[*] click (75, 156) - select Standard AI for slot 3"
+xdo mousemove 75 156 click 1
+sleep "$STEP_DELAY"
+
+click 178 563 "Observer Mode"
+
+click 37 115 "kick slot 2 AI (reopen for a real client)"
+click 37 143 "kick slot 3 AI (reopen for a real client)"
 
 echo
 echo "Done - $POD should now be hosting \"${NICKNAME}'s Game\" with 3 Players"
-echo "(host + 2 open slots)."
-echo "Next: have clients Direct-Connect, then (once joined) manually click"
-echo "Observer Mode at (178, 563) if desired - see docs/host-flow.md."
+echo "(host in Observer Mode, 2 open slots for real clients)."
+echo "Next: have clients Direct-Connect and Join."

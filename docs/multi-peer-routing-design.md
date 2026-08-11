@@ -210,29 +210,21 @@ priority order:
    path yet (stays `true` for the pod's life even through a later drop),
    which is fine for now but will need revisiting alongside item 4's
    durability work.
-2. **Auto Observer Mode**: `host-game-kube.sh` currently requires a
-   manual click on Observer Mode once both real clients have joined (see
-   `docs/host-flow.md`) - automate that transition (probably driven by
-   the same "2 real clients connected" signal as item 1, now available
-   via `GET /full`).
-   **Simplified by a 2026-08-10 manual-testing observation**: once a host
-   fills both slots (in whatever order/fashion) it appears to *stay* in
-   Observer Mode from then on, including through a later drop/rejoin -
-   i.e. this doesn't need to be a dynamic "detect 2 clients, click
-   Observer Mode, detect a drop, click it again" state machine.
-
-   **Complicated by a 2026-08-11 finding**: clicking Observer Mode was
-   confirmed working (coordinates verified, checkbox toggles, host row
-   switches to "Observer") with 2 real clients already joined - but doing
-   it at pod startup, before any client has joined, is expected to need
-   an extra precursor step, not just an earlier click. AoM's lobby is
-   believed to require both "Open" (waiting-for-human) slots to be filled
-   with an AI player before Observer Mode can be set at all, with a
-   separate per-slot "shoe icon" control to kick an AI back out once a
-   real client is ready to Direct-Connect into that slot. None of the
-   AI-fill-in or shoe-icon-kick coordinates are calibrated yet - see
-   `docs/host-flow.md`'s "Still to do". Until that's done,
-   `host-game-kube.sh` keeps the original wait-for-join approach.
+2. **Auto Observer Mode**: **done 2026-08-11**. The 2026-08-10 hypothesis
+   (Observer Mode persists once set, even through a drop/rejoin) held up:
+   confirmed again this session, both by kicking a real client and by
+   watching one drop on its own - the host's row stayed "Observer" both
+   times. What the 2026-08-10 pass didn't know yet: clicking Observer
+   Mode at pure startup (both slots still "Open") doesn't work at all -
+   AoM's lobby requires both slots filled first. The actual fix,
+   calibrated live and now built into `host-game-kube.sh`: fill both
+   "Open" slots with Standard AI, click Observer Mode, then kick both AI
+   back out via a per-slot "shoe icon" control (confirmed to work
+   identically on an AI or an already-connected real client) to leave the
+   slots open again - all at pod startup, before any real client has
+   joined, with zero manual clicks or log-polling. See
+   `docs/host-flow.md`'s "Flow (continued)" section for the full
+   calibrated coordinates and confirmation screenshots.
 3. **Ready-up automation**: **packet found and detection wired up
    2026-08-11** - see `docs/directplay8-protocol.md`'s "Ready-toggle
    sub-message" section. A 22-byte client→host settings-sync message,
@@ -256,7 +248,6 @@ priority order:
    the design (resign-signal detection + existing idle-timeout reap,
    scoped teardown, clean re-fill), none of it built yet. Needs the
    reference drop/rejoin capture this doc originally called for in step 1
-   above, still not taken. Per item 2's observation, may **not** need an
-   Observer Mode re-swap step if Observer Mode really does persist through
-   a drop/rejoin - re-verify that assumption before building any re-swap
-   logic on the strength of it.
+   above, still not taken. Per item 2's confirmation that Observer Mode
+   persists through a drop, no Observer Mode re-swap step is needed here -
+   just re-filling the vacated slot for whoever joins next.

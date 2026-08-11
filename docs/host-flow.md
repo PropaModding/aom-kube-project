@@ -100,7 +100,7 @@ output/error — avoid chord key combos, prefer repeated single-key
 | # | Screen | Action | Coordinates |
 |---|--------|--------|--------------|
 | 7 | "LAN / Direct IP" — has a "Host a LAN Game" field (pre-filled `<nickname>'s Game`), a LAN games list, and a "Type a Direct IP" field | Click **Host** | (560, 170) |
-| 8 | In-lobby host screen (player list, game name, map/game settings, **Players** dropdown top-left, **Observer Mode** checkbox bottom-left, Cancel/Other Settings) | Set **Players** to 3 (host + 2 open slots - this project only hosts 1v1s, see CLAUDE.md), then *(wait for a client to join here — see below)* | Players dropdown: click (61, 63) to open, (55, 74) to select "3". Observer Mode checkbox: (178, 563) |
+| 8 | In-lobby host screen (player list, game name, map/game settings, **Players** dropdown top-left, **Observer Mode** checkbox bottom-left, Cancel/Other Settings) | Set **Players** to 3 (host + 2 open slots - this project only hosts 1v1s, see CLAUDE.md), fill both slots with Standard AI, click **Observer Mode**, then kick both AI back out - see below, no need to wait for a join | Players dropdown: click (61, 63) to open, (55, 74) to select "3". Slot 2/3 dropdowns: (100, 115)/(100, 143) to open, (75, 128)/(75, 156) to select "Standard". Observer Mode checkbox: (178, 563). Slot 2/3 kick icon: (37, 115)/(37, 143) |
 
 **Players is a dropdown, not a text field or spinner** - confirmed by
 trial: clicking it doesn't cycle a value, and typing into it does
@@ -120,31 +120,57 @@ The lobby screen's own "IP Address:" readout in the top-left confirms the
 pod's address (e.g. `10.244.0.24`), independent of whatever `aom-lobby` is
 rewriting it to for outside clients.
 
-**Switching to Observer Mode after a client connects** (used in the
-earlier 3v3 capture, `archiving/sessions/20260803-3v3-win-loss/`, where
-the host observed rather than played): rather than a fixed delay, poll
-`kubectl logs deployment/aom-lobby` for a `new session: client ...` line
-for a *new* client address (one not seen before) to know a real join
-happened, then click the Observer Mode checkbox at (178, 563).
+**Observer Mode is now set at startup, fully automated (2026-08-11) -
+no more waiting for a join.** Earlier approach (used in the 3v3 capture,
+`archiving/sessions/20260803-3v3-win-loss/`): poll `kubectl logs
+deployment/aom-lobby` for a `new session: client ...` line for a *new*
+client address to know a real join happened, then click the checkbox -
+needed because it wasn't known yet whether clicking it before anyone had
+joined would even stick.
 
-**Confirmed 2026-08-11**: clicking the checkbox at (178, 563) (pixel-
-measured center via a VNC screenshot: (181, 563), close enough to the
-existing calibration to not bother re-numbering it) with 2 real clients
-already joined works cleanly - the host's row switches from a god pick to
-"Observer" and the two client rows renumber from 1/2/3 to 2/3.
+The checkbox itself (178, 563; pixel-measured center via a VNC
+screenshot: (181, 563), close enough to the existing calibration to not
+bother re-numbering it) was first confirmed with 2 real clients already
+joined - the host's row switches from a god pick to "Observer" and the
+client rows renumber from 1/2/3 to 2/3. Clicking it at pure startup, with
+both slots still "Open", turned out to need a precursor step first:
+**AoM's lobby requires both "Open" slots to be filled before Observer
+Mode can be set at all.** The fix, calibrated live and now built into
+`host-game-kube.sh`:
 
-**Not yet safe to click before any client has joined.** The design
-hypothesis in `docs/multi-peer-routing-design.md`'s "Next steps" item 2
-(click it once at startup, skip the log-polling entirely) turns out to be
-incomplete: while both player slots still show "Open" (waiting for a
-human, not filled), AoM's lobby is expected to require both to be filled
-first - with an AI player, clicked into each "Open" slot - before
-Observer Mode can be set at all. There's a separate per-slot "shoe icon"
-control (not yet located/calibrated) to kick an AI back out once a real
-client is actually ready to Direct-Connect into that slot, freeing it
-again. None of the AI-fill-in or shoe-icon-kick coordinates are
-calibrated yet - see "Still to do" below. Until that's done,
-`host-game-kube.sh` keeps the original wait-for-join approach.
+1. Open each "Open" slot's own dropdown (same control used for both "who
+   occupies this slot" and AI behavior - "Open" is the first entry,
+   followed by Standard/Random/Attacker/Conqueror/Builder/Protector/
+   Defender) and select **Standard**. Slot 2's dropdown opens anchored at
+   its own row (100, 115) with "Standard" 13px below at (75, 128) - same
+   list-anchoring behavior as the Players dropdown. Slot 3: (100, 143)
+   to open, (75, 156) to select.
+2. Click Observer Mode (178, 563) - now safe, since both slots are
+   filled.
+3. Click the **kick icon** on each slot to reopen it for a real client -
+   a small shoe/foot icon at the far left of each row (easy to mistake
+   for a checkmark at a glance), tooltip: *"Kick this player out of the
+   game. This option can only be used by the game host."* Slot 2: (37,
+   115). Slot 3: (37, 143). Confirmed to work identically whether the
+   slot holds an AI or an already-connected real client (tested live by
+   kicking a real joined client - the client's own game reported being
+   disconnected, and the host's chat log printed `"<host>: <name> was
+   kicked out of the room."`), so this same control is also how a
+   stuck/disconnected real client would eventually get removed, not just
+   AI cleanup.
+
+**Observer Mode persists through both a kick and a client-initiated
+disconnect** - confirmed live 2026-08-11 (kicking a real client, and
+separately watching a real client drop on its own, both left the host's
+row still reading "Observer"), matching the original 2026-08-10
+observation. An earlier draft of this doc briefly claimed the opposite
+based on a screenshot that looked ambiguous (a blank cell where "Observer"
+normally renders) - that read was wrong; trust the in-game state over an
+ambiguous render.
+
+End-to-end result, verified against a fresh pod: host lands in Observer
+Mode with both slots back to "Open," zero manual clicks, before any real
+client has connected.
 
 ## Full calibrated sequence (800x600 coordinates, `xdotool` in-container)
 
@@ -169,8 +195,20 @@ calibrated yet - see "Still to do" below. Until that's done,
     sleep 1
     (55, 74)    click   select "3" (host + 2 open slots)
     sleep 5
-7.  -- wait for a client join (poll aom-lobby logs) --
-    (178, 563)  click   "Observer Mode"
+7.  (100, 115)  click   open slot 2 dropdown
+    sleep 1
+    (75, 128)   click   select "Standard" AI for slot 2
+    sleep 5
+8.  (100, 143)  click   open slot 3 dropdown
+    sleep 1
+    (75, 156)   click   select "Standard" AI for slot 3
+    sleep 5
+9.  (178, 563)  click   "Observer Mode"
+    sleep 5
+10. (37, 115)   click   kick slot 2 AI (reopens it for a real client)
+    sleep 5
+11. (37, 143)   click   kick slot 3 AI (reopens it for a real client)
+    sleep 5
 ```
 
 Run via `kubectl exec <pod> -- xdotool mousemove X Y click 1` per step
@@ -181,8 +219,8 @@ Run via `kubectl exec <pod> -- xdotool mousemove X Y click 1` per step
 `host-game-kube.sh [nickname]` runs the calibrated sequence above
 end-to-end via `kubectl exec ... xdotool` (no VNC/`vncdotool` involved in
 the actual run — that stays a calibration-only tool, see "Gotcha" above).
-Leaves the pod sitting in the hosted lobby; does not click Observer Mode
-(that needs a live client join to time correctly) or start the match.
+Leaves the pod sitting in the hosted lobby, host already in Observer Mode
+with both slots open for real clients; does not start the match.
 Defaults to nickname `AOMHOST`, but for manual/live-debug runs watched
 over Remmina/VNC, `TheIP` (`./host-game-kube.sh TheIP`) is the nickname
 convention in use — named after the thing a client actually needs to
@@ -205,19 +243,14 @@ was caught watching live over VNC.)
 
 ## Still to do
 
-- The Observer-Mode click and match-start aren't automated — the former
-  needs a live client join to time correctly (poll `aom-lobby` logs, see
-  above), the latter is out of scope for the current DPNID-capture goal,
-  which only needs players *joined*, not a match in progress.
-- **AI-fill-in + shoe-icon kick, for a startup-time Observer Mode click**
-  (queued 2026-08-11): to click Observer Mode right at startup instead of
-  waiting for a join (the simplification `docs/multi-peer-routing-
-  design.md`'s "Next steps" item 2 wants), both "Open" slots need an AI
-  player clicked into them first, and each slot has a separate "shoe
-  icon" control to kick that AI back out once a real client is ready to
-  Direct-Connect into the freed slot. Neither the AI-fill click target
-  nor the shoe icon's coordinates are calibrated yet - needs a VNC
-  screenshot pass same as everything else in this doc.
+- Match-start isn't automated - out of scope for the current
+  DPNID-capture goal, which only needs players *joined*, not a match in
+  progress. See `docs/directplay8-protocol.md`'s "Ready-toggle
+  sub-message" section and `docs/multi-peer-routing-design.md`'s
+  "Next steps" item 3 for the packet-detection half of this (done); what's
+  still missing is `aom-lobby` actually being able to command the pod
+  (e.g. `kubectl exec ... xdotool`) once it knows both real clients are
+  ready.
 - Game name/map/settings are currently left at their defaults
   (`Supremacy`, `Random` map, `Normal` size, `Easy` difficulty) — revisit
   if a capture needs specific settings.
