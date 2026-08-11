@@ -248,8 +248,20 @@ connection ID are per-sender, not a shared conversation counter.
 
 ### Player-announce sub-message (93 bytes total this capture)
 
+**Correction (2026-08-11):** the `16 16` pair below isn't a constant part
+of the sub-header — it's per-connection. See the "Ready-toggle
+sub-message" section below, which observed the same `01 08 02 <2 bytes>`
+prefix with `16 16` for one real client and `17 17` for the other, in the
+same session. Likely a compact per-player/connection identifier reused
+across every sub-message this family sends, not specific to
+player-announce. Only one player pair was captured when this section was
+originally written, which is why the value looked constant.
+
 ```
-01 08 02 16 16                       sub-header (constant shape observed)
+01 08 02 16 16                       sub-header (constant shape observed
+                                      in this specific capture; the last
+                                      2 bytes are actually per-connection,
+                                      see the correction above)
 <4 bytes>                            unclear, possibly a settings/version flag
 24 30 27 00 00 00 00 00 00           unclear, possibly a numeric player ID or slot flag
 7b <GUID as ASCII, with braces> 7d 00    player's DirectPlay GUID
@@ -325,6 +337,73 @@ Harmless artifact, not a protocol requirement — nothing to replicate.
 No text content. Fired frequently by both sides (seq/conn-ID matching
 whichever sub-message it's paired with) — a lightweight ack/heartbeat for
 this layer, not an independent message in its own right.
+
+### Ready-toggle sub-message (22 bytes, client→host, 2026-08-11)
+
+Found the way most of this protocol has been found: by volume, not by
+guessing. During a live 2-real-client test session (`aom-lobby`'s
+`VERBOSE`-free logging already hex-dumps every non-`0x03`-handshake
+session packet), the routine settings-sync/heartbeat chatter this layer
+constantly generates is entirely 10, 12, or 16 bytes — thousands of
+packets, three lengths. Toggling one client's in-lobby Ready checkbox
+produced exactly one packet at a fourth length (22 bytes) each time,
+immediately and reliably, with nothing else in the surrounding traffic
+changing. `grep -oP '\(\d+ bytes\)' | sort | uniq -c` against a live log
+capture is a reusable technique for finding a rare, event-driven message
+buried in dense periodic traffic like this.
+
+Uses the common 8-byte wrapper (`03 00` + seq + connection ID), then:
+
+```
+01 08 02 <2 bytes>                   sub-header - same `01 08 02 <2 bytes>`
+                                      shape as the player-announce sub-
+                                      message above, and the `<2 bytes>`
+                                      here is the same per-connection value
+                                      too (confirmed: one real client's
+                                      Ready-toggle packets consistently
+                                      carried `16 16`, the other `17 17`,
+                                      matching each client's own value
+                                      from its player-announce packets in
+                                      the same session)
+03 00 00 00 00 02                    constant, identical for both clients
+                                      and both ready states
+<1 byte>                             the Ready boolean: 00 = not ready,
+                                      01 = ready - confirmed by toggling
+                                      one real client off then on and
+                                      diffing, then repeating on the
+                                      second real client to confirm it's
+                                      not connection-specific
+<2 bytes>                            trailer, changes every message - most
+                                      likely a checksum or seq-derived
+                                      value, not further decoded
+```
+
+Full confirmed captures (client → host, i.e. what the host/backend
+actually receives — see `docs/multi-peer-routing-design.md`'s Ready-up
+automation item, which needs exactly this):
+
+```
+clientA not ready: 03 00 c2 0e d6 11 0c 00 01 08 02 16 16 03 00 00 00 00 02 00 eb 0e
+clientA ready:      03 00 c5 0e d6 11 0c 00 01 08 02 16 16 03 00 00 00 00 02 01 ed 0e
+clientB not ready: 03 00 f5 0b f2 23 0c 00 01 08 02 17 17 03 00 00 00 00 02 00 1d 0c
+clientB ready:      03 00 81 08 f2 23 0c 00 01 08 02 17 17 03 00 00 00 00 02 01 a9 08
+```
+
+The `0c 00` length prefix right after the wrapper (byte offset 6-7) reads
+12 (decimal) but the sub-message's own declared portion (`01 08 02 <2
+bytes> 03 00 00 00 00 02 <ready byte>`) is exactly 12 bytes - the 2-byte
+trailer sits *after* the declared length, same "declared length doesn't
+cover a small fixed trailer" pattern already noted for the lobby-chat
+sub-message below, not a one-off.
+
+**Not yet checked**: whether the host ever echoes/broadcasts a ready
+state change back out to the *other* real client (the way it does for
+new-peer/existing-peer addresses, see `lobby/main.go`'s
+`isNewPeerBroadcast`/`isExistingPeerBroadcast`) - this capture only ever
+looked at client→host traffic, since that's what a host-side automation
+needs to react to. If the host's own Ready-crystal display for other
+players' rows is driven by a broadcast rather than each client just
+inferring it, that broadcast hasn't been identified yet.
 
 ### Lobby chat (41 bytes this capture)
 

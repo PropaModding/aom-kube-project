@@ -127,6 +127,25 @@ the host observed rather than played): rather than a fixed delay, poll
 for a *new* client address (one not seen before) to know a real join
 happened, then click the Observer Mode checkbox at (178, 563).
 
+**Confirmed 2026-08-11**: clicking the checkbox at (178, 563) (pixel-
+measured center via a VNC screenshot: (181, 563), close enough to the
+existing calibration to not bother re-numbering it) with 2 real clients
+already joined works cleanly - the host's row switches from a god pick to
+"Observer" and the two client rows renumber from 1/2/3 to 2/3.
+
+**Not yet safe to click before any client has joined.** The design
+hypothesis in `docs/multi-peer-routing-design.md`'s "Next steps" item 2
+(click it once at startup, skip the log-polling entirely) turns out to be
+incomplete: while both player slots still show "Open" (waiting for a
+human, not filled), AoM's lobby is expected to require both to be filled
+first - with an AI player, clicked into each "Open" slot - before
+Observer Mode can be set at all. There's a separate per-slot "shoe icon"
+control (not yet located/calibrated) to kick an AI back out once a real
+client is actually ready to Direct-Connect into that slot, freeing it
+again. None of the AI-fill-in or shoe-icon-kick coordinates are
+calibrated yet - see "Still to do" below. Until that's done,
+`host-game-kube.sh` keeps the original wait-for-join approach.
+
 ## Full calibrated sequence (800x600 coordinates, `xdotool` in-container)
 
 ```
@@ -190,6 +209,15 @@ was caught watching live over VNC.)
   needs a live client join to time correctly (poll `aom-lobby` logs, see
   above), the latter is out of scope for the current DPNID-capture goal,
   which only needs players *joined*, not a match in progress.
+- **AI-fill-in + shoe-icon kick, for a startup-time Observer Mode click**
+  (queued 2026-08-11): to click Observer Mode right at startup instead of
+  waiting for a join (the simplification `docs/multi-peer-routing-
+  design.md`'s "Next steps" item 2 wants), both "Open" slots need an AI
+  player clicked into them first, and each slot has a separate "shoe
+  icon" control to kick that AI back out once a real client is ready to
+  Direct-Connect into the freed slot. Neither the AI-fill click target
+  nor the shoe icon's coordinates are calibrated yet - needs a VNC
+  screenshot pass same as everything else in this doc.
 - Game name/map/settings are currently left at their defaults
   (`Supremacy`, `Random` map, `Normal` size, `Easy` difficulty) — revisit
   if a capture needs specific settings.

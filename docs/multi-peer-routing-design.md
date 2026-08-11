@@ -203,35 +203,54 @@ Base P2P routing is done and confirmed working (real 2-client join,
 both directions, chat verified). Queued for next session, roughly in
 priority order:
 
-1. **Lobby-status endpoint for "fully staffed"**: extend the existing
-   `GET /hosts`/`GET /waiting` HTTP status endpoints (see
-   `docs/lobby-status-api.md`, `lobby/main.go`'s `hostProbe`) with a way
-   to report "this host has a full lobby" (host + 2 real clients, no
-   open slots) - needed by whatever automates provisioning/routing new
-   Direct-Connects into existing vs. new matches per CLAUDE.md's
-   Architecture intention.
+1. ~~**Lobby-status endpoint for "fully staffed"**~~ - done 2026-08-11:
+   `GET /full` added (`matchState.full()` in `lobby/main.go`), backed by
+   the A<->B pair relay's existence rather than a new probe - see
+   `docs/lobby-status-api.md`'s "How it decides full" section. No reset
+   path yet (stays `true` for the pod's life even through a later drop),
+   which is fine for now but will need revisiting alongside item 4's
+   durability work.
 2. **Auto Observer Mode**: `host-game-kube.sh` currently requires a
    manual click on Observer Mode once both real clients have joined (see
    `docs/host-flow.md`) - automate that transition (probably driven by
-   the same "2 real clients connected" signal as item 1).
+   the same "2 real clients connected" signal as item 1, now available
+   via `GET /full`).
    **Simplified by a 2026-08-10 manual-testing observation**: once a host
    fills both slots (in whatever order/fashion) it appears to *stay* in
    Observer Mode from then on, including through a later drop/rejoin -
    i.e. this doesn't need to be a dynamic "detect 2 clients, click
-   Observer Mode, detect a drop, click it again" state machine. It might
-   be enough to just click Observer Mode **once**, possibly even as part
-   of the pod's initial startup sequence before any real client has
-   joined at all - worth trying that first, since it would also make
-   item 4's durability work simpler (no Observer Mode re-swap logic
-   needed on reconnect). Not yet verified rigorously - the "stays in
-   Observer Mode" claim is from informal testing, not a captured/confirmed
-   behavior.
-3. **Ready-up automation**: figure out what packet(s) signal both real
-   players have hit Ready, and drive the host's own response
-   automatically via `xdotool` from inside the container - packet-driven
-   preferred over polling/screenshotting, so this needs its own
-   reverse-engineering pass first (same method as everything else in
-   `docs/directplay8-protocol.md`: diff a genuine ready-up capture).
+   Observer Mode, detect a drop, click it again" state machine.
+
+   **Complicated by a 2026-08-11 finding**: clicking Observer Mode was
+   confirmed working (coordinates verified, checkbox toggles, host row
+   switches to "Observer") with 2 real clients already joined - but doing
+   it at pod startup, before any client has joined, is expected to need
+   an extra precursor step, not just an earlier click. AoM's lobby is
+   believed to require both "Open" (waiting-for-human) slots to be filled
+   with an AI player before Observer Mode can be set at all, with a
+   separate per-slot "shoe icon" control to kick an AI back out once a
+   real client is ready to Direct-Connect into that slot. None of the
+   AI-fill-in or shoe-icon-kick coordinates are calibrated yet - see
+   `docs/host-flow.md`'s "Still to do". Until that's done,
+   `host-game-kube.sh` keeps the original wait-for-join approach.
+3. **Ready-up automation**: **packet found and detection wired up
+   2026-08-11** - see `docs/directplay8-protocol.md`'s "Ready-toggle
+   sub-message" section. A 22-byte client→host settings-sync message,
+   found by packet-length frequency analysis against a live 2-real-client
+   session (routine traffic is entirely 10/12/16 bytes; toggling Ready
+   reliably produced a single 22-byte outlier). `lobby/main.go`'s
+   `isReadyToggle()`/`readyToggleState()` detect it and log
+   `client %s ready-toggle: %v` on every toggle in either direction -
+   confirmed live against both real clients, both ready and un-ready.
+   **Still to do**: driving the host's own response (starting the match)
+   once both real clients are ready - not built yet, and needs a way for
+   `aom-lobby` to actually command the pod (`kubectl exec ... xdotool`,
+   same mechanism `host-game-kube.sh` uses, but `aom-lobby` doesn't have
+   k8s API access today) once it knows both are ready. Also unconfirmed:
+   whether the host ever broadcasts a ready-state change back out to the
+   *other* real client (see the doc section's "Not yet checked" note) -
+   only client→host traffic was captured so far, since that's what a
+   host-side automation needs to react to.
 4. **Durability**: a client drops mid-match, a new client joins the
    vacated slot - the original "Durability" section above still describes
    the design (resign-signal detection + existing idle-timeout reap,

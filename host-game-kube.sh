@@ -155,6 +155,19 @@ echo "[*] click (55, 74) - select 3 Players"
 xdo mousemove 55 74 click 1
 sleep "$STEP_DELAY"
 
+# --- Observer Mode: NOT yet automated here. Confirmed 2026-08-11 that
+# the checkbox at (178, 563) works and sticks once both real clients have
+# already joined (docs/host-flow.md). Clicking it earlier - right after
+# selecting 3 Players, while both slots still say "Open" - is suspected
+# NOT to work as-is: AoM's lobby reportedly requires both slots to be
+# filled (with AI, via clicking each "Open" slot) before Observer Mode
+# can be set, with a separate "shoe icon" per-slot control to kick an AI
+# player back out once a real client is ready to Direct-Connect into that
+# slot. Coordinates for both the AI-fill click and the shoe-icon kick
+# aren't calibrated yet - see docs/host-flow.md's "Still to do". Until
+# that's done, this script leaves Observer Mode for a manual/live-debug
+# click same as before.
+
 echo
 echo "Done - $POD should now be hosting \"${NICKNAME}'s Game\" with 3 Players"
 echo "(host + 2 open slots)."

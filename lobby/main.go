@@ -9,6 +9,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
@@ -237,6 +238,64 @@ func isExistingPeerBroadcast(payload []byte) bool {
 func rewriteExistingPeerBroadcast(payload []byte, relayIP [4]byte, relayPort uint16) []byte {
 	out := rewriteSessionField(payload, existingPeerAddrOffset1, relayIP, relayPort)
 	return rewriteSessionField(out, existingPeerAddrOffset2, relayIP, relayPort)
+}
+
+// readyToggle is the client->host settings-sync sub-message a client
+// sends when its in-lobby Ready checkbox is toggled - see
+// docs/directplay8-protocol.md's "Ready-toggle sub-message" section for
+// how this was found (by packet-length frequency analysis against a live
+// 2-real-client session: routine settings-sync/heartbeat traffic is
+// entirely 10/12/16 bytes, and toggling Ready reliably produced a single
+// 22-byte outlier each time). No address embedded, so unlike
+// newPeerBroadcast/existingPeerBroadcast there's nothing to rewrite here
+// - just something to detect and log, the first piece of
+// docs/multi-peer-routing-design.md's "Ready-up automation" next step
+// (driving the host's own response once both real clients are ready is
+// not yet built).
+//
+// Shares its `01 08 02 <2 bytes>` sub-header with the player-announce
+// sub-message documented above it - the trailing 2 bytes are a stable
+// per-connection value (confirmed against 2 real clients: one
+// consistently `16 16`, the other `17 17`), not something worth matching
+// on here since it varies per client. What's matched instead is the
+// constant run at readyToggleConstOffset (`03 00 00 00 00 02`, identical
+// across both clients and both ready states in every capture) plus the
+// fixed total length - the boolean itself lives at readyToggleBoolOffset,
+// immediately after that constant run.
+const (
+	readyToggleLen          = 22
+	readyToggleSubType0     = 0x01
+	readyToggleSubType1     = 0x08
+	readyToggleSubType2     = 0x02
+	readyToggleSubTypeOffset = 8
+	readyToggleConstOffset  = 13
+	readyToggleBoolOffset   = 19
+)
+
+var readyToggleConst = []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x02}
+
+// isReadyToggle reports whether payload is a session-port (0x03 wrapper)
+// settings-sync message matching readyToggle's shape above.
+func isReadyToggle(payload []byte) bool {
+	if len(payload) != readyToggleLen {
+		return false
+	}
+	if payload[0] != newPeerWrapperType0 || payload[1] != newPeerWrapperType1 {
+		return false
+	}
+	if payload[readyToggleSubTypeOffset] != readyToggleSubType0 ||
+		payload[readyToggleSubTypeOffset+1] != readyToggleSubType1 ||
+		payload[readyToggleSubTypeOffset+2] != readyToggleSubType2 {
+		return false
+	}
+	return bytes.Equal(payload[readyToggleConstOffset:readyToggleConstOffset+len(readyToggleConst)], readyToggleConst)
+}
+
+// readyToggleState reads the ready boolean out of a payload already
+// confirmed by isReadyToggle - true means the client just marked itself
+// ready, false means it just unmarked itself.
+func readyToggleState(payload []byte) bool {
+	return payload[readyToggleBoolOffset] == 0x01
 }
 
 func isSessionHandshake(payload []byte) bool {
@@ -876,6 +935,22 @@ func (m *matchState) ensurePairRelay(selfAddr, otherAddr *net.UDPAddr) *pairRela
 	return relay
 }
 
+// full reports whether this match's A<->B pair relay has been created -
+// which only happens once both real clients have connected and the host
+// has broadcast each one's address to the other (see ensurePairRelay's
+// callers in sessionProxy's rewriteToClient). That makes it a reliable
+// "host + 2 real clients, no open slots" signal for free: unlike
+// hostProbe's discovery-query check (which answers "is a client welcome to
+// browse in", true right up until the lobby actually fills), this reflects
+// the pairing having actually completed. Matchmaking needs this to decide
+// a newly-connecting client should get a new pod rather than being routed
+// into a match that's already staffed - see docs/lobby-status-api.md.
+func (m *matchState) full() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pair != nil
+}
+
 func main() {
 	cfg := loadConfig()
 
@@ -939,6 +1014,9 @@ func main() {
 		backendUDPAddr: sessionBackendUDPAddr,
 		tracker:        tracker,
 		rewriteToBackend: func(payload []byte, cfg config, sess *session) []byte {
+			if isReadyToggle(payload) {
+				log.Printf("[session] client %s ready-toggle: %v", sess.clientAddr, readyToggleState(payload))
+			}
 			if !isSessionHandshake(payload) {
 				if cfg.verbose {
 					log.Printf("[session] client->backend non-handshake (%d bytes): %s", len(payload), hex.EncodeToString(payload))
@@ -1027,8 +1105,11 @@ func main() {
 	statusMux.HandleFunc("/waiting", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "%t\n", probe.hasWaitingGame())
 	})
+	statusMux.HandleFunc("/full", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%t\n", match.full())
+	})
 	go func() {
-		log.Printf("aom-lobby: status endpoint on %s (GET /hosts -> number of hosts waiting for players, GET /waiting -> is there a game with a player waiting)", cfg.statusListenAddr)
+		log.Printf("aom-lobby: status endpoint on %s (GET /hosts -> number of hosts waiting for players, GET /waiting -> is there a game with a player waiting, GET /full -> does the match already have both real clients)", cfg.statusListenAddr)
 		if err := http.ListenAndServe(cfg.statusListenAddr, statusMux); err != nil {
 			log.Fatalf("status server on %q: %v", cfg.statusListenAddr, err)
 		}
