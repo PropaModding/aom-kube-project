@@ -36,6 +36,30 @@ spec:
           env:
             - name: ENABLE_VNC
               value: "1"
+            # Diagnostic pass, 2026-08-12 (see lobby/packet-handling-design.md's
+            # "what changes I'd make" discussion): entrypoint.sh's final
+            # `exec "$@"` inherits this like any other env var, and Wine
+            # reads WINEDEBUG directly - no entrypoint.sh changes needed.
+            # stderr goes straight to `kubectl logs`, same as any other
+            # container.
+            #
+            # Correction (2026-08-12, same session): tried +relay here
+            # first, matching run-aom-spoofed-client.sh's
+            # FULL_RELAY_TRACE option - wrong call. On the actual host
+            # process (talking to two clients simultaneously, far busier
+            # than a single test client ever is) it produced ~10,000 log
+            # lines/second and completely saturated the pod - it stopped
+            # answering discovery queries at all within seconds, `/hosts`
+            # went to 0, real client Direct-Connects would have hung on
+            # nothing. Reverted to the same lighter channel set the test
+            # clients use without FULL_RELAY_TRACE. If the socket-level
+            # question this was meant to answer (does the host's
+            # newPeerBroadcast send use a different local port than
+            # ordinary reply traffic?) still needs answering, +relay
+            # needs a narrower net.dll-only channel or a live strace
+            # instead of blanket Win32 call tracing - not this.
+            - name: WINEDEBUG
+              value: "+timestamp,+dpwsockx,+dplay,+dplaysvc,+dpnet,+winsock,+ws2_32"
           ports:
             - name: vnc
               containerPort: 5900
@@ -45,6 +69,8 @@ spec:
             - name: dp8-session
               containerPort: 2300
               protocol: UDP
+            - name: input-agent
+              containerPort: 8082
           resources:
             requests:
               cpu: "500m"
@@ -67,7 +93,14 @@ spec:
   type: ClusterIP
 ---
 # Stable in-cluster address for the real pod's DirectPlay8 ports, so
-# aom-lobby doesn't have to chase pod IPs across restarts.
+# aom-lobby doesn't have to chase pod IPs across restarts. Also carries
+# input-agent's TCP port: unlike SESSION_BACKEND_ADDR (deliberately
+# pinned to the pod's raw IP - see deploy-minikube.sh - since the session
+# proxy's backend-initiated-relay logic matches on that traffic's real
+# source address), aom-lobby's calls to input-agent are plain client-
+# initiated HTTP requests with no such constraint, so there's no reason
+# not to use this Service's stable DNS name instead of chasing the pod IP
+# the same way SESSION_BACKEND_ADDR has to.
 apiVersion: v1
 kind: Service
 metadata:
@@ -84,4 +117,8 @@ spec:
       port: 2300
       targetPort: 2300
       protocol: UDP
+    - name: input-agent
+      port: 8082
+      targetPort: 8082
+      protocol: TCP
   type: ClusterIP

@@ -6,6 +6,56 @@
 // back to the proxy rather than the pod's internal address — on the
 // discovery port (2299) as well as the session port (2300), whose
 // handshake packets leak the same kind of address if left alone.
+//
+// # Protocol layering and how it maps to the official DirectPlay 8 docs
+//
+// AoM (2002) predates real DirectPlay 8 (shipped with DirectX 8, 2000) and
+// uses "classic DirectPlay" instead (Wine modules dpwsockx.dll/dplayx.dll,
+// not dpnet.dll) - confirmed 2026-08-10, see docs/directplay8-protocol.md.
+// Microsoft's official Open Specifications for real DirectPlay 8
+// ([MC-DPL8CS] "Core and Service Providers", [MC-DPL8R] "Reliable" -
+// fetched into docs/directplay8-reference/, gitignored, not checked in)
+// do NOT byte-match anything below - classic DirectPlay's wire format is
+// undocumented and was reverse-engineered from scratch (see
+// docs/directplay8-protocol.md). What the official docs DO give us is a
+// same-vendor, same-problem-space structural reference: DirectPlay 8 is
+// an evolution of the same design lineage, and its documented layering
+// and message *sequences* line up suspiciously well with what's been
+// independently reverse-engineered here. Every cross-reference below is
+// exactly that - a structural hypothesis worth knowing about, not a
+// confirmed byte-for-byte mapping. See
+// docs/directplay8-packet-classification.md for the full writeup.
+//
+// Two layers, matching the official docs' own split into two documents:
+//
+//  1. A reliable-delivery layer, roughly analogous to [MC-DPL8R]'s DFRAME
+//     (data frame) structure (section 2.2.2): bCommand(1)+bControl(1)+
+//     bSeq(1)+bNRcv(1), a FIXED 4-byte header, followed by optional
+//     SACK/send-mask/signature/session-ID fields (gated by bControl
+//     flags), followed by the upper-layer payload. This proxy's own
+//     comments have historically mislabeled this as a "03 00 <seq>
+//     <conn-id>" 6-byte wrapper (2-byte type + 2-byte seq + 2-byte
+//     conn-id) - the offsets used for detection/rewriting throughout
+//     this file are all empirically confirmed against real captures and
+//     are NOT in question, but the semantic labels likely are: what's
+//     been called "seq" (2 bytes) is more likely bSeq+bNRcv as two
+//     separate 1-byte fields (matching independently-observed
+//     single-byte-incrementing counters in capture analysis - see
+//     docs/directplay8-protocol.md), and what's been called "conn-id"
+//     (2 bytes right after) is more likely just the start of the
+//     upper-layer payload below, not a reliable-layer field at all.
+//     [MC-DPL8R] also documents CFRAMEs (command frames, no payload -
+//     CONNECT/CONNECTED/CONNECTED_SIGNED/HARD_DISCONNECT/SACK) as a
+//     separate message class from DFRAMEs; this proxy has never observed
+//     or needed to distinguish those explicitly, since every message
+//     handled below already carries payload (the type-0x00/0x02 session
+//     handshake and everything under the "03 00" wrapper).
+//  2. An upper-layer payload, analogous to [MC-DPL8CS] "Core and Service
+//     Providers" - session/name-table management (connect, add player,
+//     instruct-connect, disconnect, etc.). This is the layer where every
+//     message this file actually parses lives - see each function's own
+//     doc comment for its specific [MC-DPL8CS] cross-reference, where one
+//     exists.
 package main
 
 import (
@@ -30,6 +80,15 @@ const (
 
 	probeInterval = 3 * time.Second
 	probeTimeout  = 1 * time.Second
+
+	// otherSessionPollTimeout/Interval bound pollOtherSessionClientAddr's
+	// retry loop - see that method's doc comment. 5s is generous relative
+	// to how close together both real clients' sessions were observed
+	// landing in every capture so far (well under a second), while still
+	// bounded so a genuinely-solo session (host probe, or a client that
+	// never gets a second peer) doesn't block indefinitely.
+	otherSessionPollTimeout  = 5 * time.Second
+	otherSessionPollInterval = 100 * time.Millisecond
 )
 
 // discoveryAddressOffsets gives the byte offset(s) within a UDP 2299
@@ -37,6 +96,15 @@ const (
 // sockaddr_in blocks that carry the real host address and need rewriting
 // before the packet reaches a client. Every other message type (0x25
 // query, 0x20 client ping) is forwarded byte-for-byte unmodified.
+//
+// Likely official-DP8 analog (structural, not byte-confirmed - see this
+// file's top-of-file "Protocol layering" comment): [MC-DPL8CS] section
+// 1.2.2 lists a *third*, separate informative reference alongside Core
+// and Reliable - [MC-DPLHP], "DirectPlay 8 Host and Port Enumeration
+// Protocol" - for exactly this job (LAN host discovery, port 2299's
+// role here). Not fetched/read as part of this pass; if picking up
+// discovery-port work again, that document is the one to read first,
+// same way [MC-DPL8CS] turned out to be for the session-port work below.
 var discoveryAddressOffsets = map[byte][]int{
 	0x26: {5, 21}, // discovery/Direct-Connect reply: two duplicate blocks
 	// Ping reply/request is the same 41-byte shape as 0x26 minus the
@@ -63,6 +131,23 @@ var discoveryAddressOffsets = map[byte][]int{
 // docs/directplay8-protocol.md): the "self" block is what the receiving
 // side's DirectPlay8 stack uses as the destination for its own subsequent
 // sends, bypassing this proxy entirely if left unrewritten.
+//
+// Likely official-DP8 analog (structural, not byte-confirmed - see this
+// file's top-of-file "Protocol layering" comment): type 0x00 ("open") and
+// type 0x02 (ack) never carry the "03 00" settings-sync wrapper seen
+// everywhere else on this port (they're a flat 40 bytes with no such
+// prefix) - i.e. they sit *outside* whatever this proxy's reliable-layer
+// wrapper is, structurally the same way [MC-DPL8R]'s CFRAMEs (CONNECT/
+// CONNECTED/CONNECTED_SIGNED, section 2.2.1) are a distinct class from
+// payload-carrying DFRAMEs, distinguished by not having
+// PACKET_COMMAND_DATA set. [MC-DPL8R]'s own sample connection sequence
+// (section 4.1) is CFRAME CONNECT -> CFRAME CONNECTED (x2, one each
+// direction) -> DFRAME KeepAlive both ways - a 2-step connect handshake
+// before any reliable-layer traffic, versus classic DirectPlay's
+// documented 4-step 0x00/0x00/0x02/0x02 (see
+// docs/directplay8-protocol.md's "Connection-establishment handshake has
+// 4 steps, not 2" section) - different step count, same shape of idea
+// (a short unwrapped handshake precedes the wrapped data layer).
 //
 // Correction (2026-08-07): originally believed "peer" never needed
 // touching, on the assumption each hop rewriting its own outgoing "self"
@@ -92,6 +177,17 @@ const (
 // 2026-08-08 (docs/directplay8-protocol.md's "Sessions are genuinely
 // peer-to-peer" section) as the one message that seeds every
 // peer-to-peer session - see docs/multi-peer-routing-design.md.
+//
+// Likely official-DP8 analog (structural, not byte-confirmed - see this
+// file's top-of-file "Protocol layering" comment): [MC-DPL8CS] section
+// 2.2.1.7 DN_ADD_PLAYER - "sent from the host, instructs peers to add
+// the specified peer to the game session," carrying the new peer's name
+// table entry (dpnid, name, url - an addressing structure). Per
+// [MC-DPL8CS] Figure 6 ("Peer-to-Peer Connect Sequence," section
+// 3.1.5.2), the host sends this to already-connected peers at the SAME
+// moment it responds to the connecting peer with DN_SEND_CONNECT_INFO -
+// matching newPeerBroadcast's own confirmed timing exactly (fired
+// alongside the new peer's own join, not on any later trigger).
 //
 // Rewritten live (2026-08-10) to point at a dedicated A<->B pair relay
 // (see newPairRelay/matchState below) instead of just logged: confirmed
@@ -196,6 +292,40 @@ func rewriteNewPeerBroadcast(payload []byte, relayIP [4]byte, relayPort uint16) 
 // hand - the sub-type/length markers above are best-effort labels, not
 // confirmed semantics. What's confirmed is the address offsets and the
 // 87-byte total length, both directly measured from the real packet.
+//
+// Likely official-DP8 analog (structural, not byte-confirmed - see this
+// file's top-of-file "Protocol layering" comment): [MC-DPL8CS] section
+// 2.2.1.9 DN_INSTRUCT_CONNECT - "instructs a peer to connect to a
+// designated peer," sent by the host to BOTH the connecting peer and
+// existing peers simultaneously per Figure 6 (section 3.1.5.2), not just
+// the existing side - which is exactly the missing-direction bug this
+// message and its detection/rewrite exist to fix (see the "Correction"
+// paragraph above). One structural mismatch worth flagging: DN_INSTRUCT_
+// CONNECT itself only carries a dpnid (numeric player ID), no address -
+// the spec's model has the connecting peer already holding every
+// existing peer's address from its own earlier DN_SEND_CONNECT_INFO
+// reply (2.2.1.4), with DN_INSTRUCT_CONNECT just the "go now" signal.
+// Classic DirectPlay's existingPeerBroadcast instead embeds the address
+// directly in this one message - a plausible protocol-family difference
+// rather than a reason to doubt the mapping, since the confirmed
+// behavior (host actively tells the new peer about the existing one,
+// timed with the new peer's own join) matches regardless of which side
+// carries the address bytes.
+//
+// 2026-08-12 (unresolved as of this writing): a live 2-client
+// join reproducibly shows a same-shaped 51-byte 0x29 packet reaching the
+// EXISTING peer's own network interface with this proxy's rewrite never
+// having touched it (confirmed via full aom-lobby log inspection: zero
+// matching log lines, and every code path that writes to a client here
+// unconditionally logs on this branch) - i.e. traffic that appears to
+// bypass this process's socket entirely, most likely the backend pod
+// sending directly to the recorded (broken/constant) address via its
+// pod-network default route, something only possible because this
+// project's local test topology colocates the pod network and the
+// docker bridge network on one machine - a real deployment's backend pod
+// would have no route to a real player's internet address at all. Not
+// yet confirmed root-caused; see the 2026-08-12 session notes/commit
+// history for the live debugging trail if picking this up.
 const (
 	existingPeerWrapperType0 = 0x03
 	existingPeerWrapperType1 = 0x00
@@ -248,10 +378,20 @@ func rewriteExistingPeerBroadcast(payload []byte, relayIP [4]byte, relayPort uin
 // entirely 10/12/16 bytes, and toggling Ready reliably produced a single
 // 22-byte outlier each time). No address embedded, so unlike
 // newPeerBroadcast/existingPeerBroadcast there's nothing to rewrite here
-// - just something to detect and log, the first piece of
-// docs/multi-peer-routing-design.md's "Ready-up automation" next step
-// (driving the host's own response once both real clients are ready is
-// not yet built).
+// - just something to detect (see matchState.setReady below, which
+// drives triggerMatchStart via input-agent once both real clients read
+// ready - built 2026-08-11, docs/multi-peer-routing-design.md's
+// "Ready-up automation" item).
+//
+// No official-DP8 analog expected, unlike every other message this file
+// parses: [MC-DPL8CS]'s own message set (section 2.2) is exhaustively
+// session/name-table management - connect, disconnect, groups, update
+// info - with no concept of a player-ready flag anywhere in it. That
+// tracks: "ready to start" is game-defined semantics riding as opaque
+// data *payload*, not something either the reliable layer or the
+// session-management layer has any reason to know about. This is the
+// one message in this file that's genuinely all classic-AoM, not
+// DirectPlay-anything.
 //
 // Shares its `01 08 02 <2 bytes>` sub-header with the player-announce
 // sub-message documented above it - the trailing 2 bytes are a stable
@@ -263,13 +403,13 @@ func rewriteExistingPeerBroadcast(payload []byte, relayIP [4]byte, relayPort uin
 // fixed total length - the boolean itself lives at readyToggleBoolOffset,
 // immediately after that constant run.
 const (
-	readyToggleLen          = 22
-	readyToggleSubType0     = 0x01
-	readyToggleSubType1     = 0x08
-	readyToggleSubType2     = 0x02
+	readyToggleLen           = 22
+	readyToggleSubType0      = 0x01
+	readyToggleSubType1      = 0x08
+	readyToggleSubType2      = 0x02
 	readyToggleSubTypeOffset = 8
-	readyToggleConstOffset  = 13
-	readyToggleBoolOffset   = 19
+	readyToggleConstOffset   = 13
+	readyToggleBoolOffset    = 19
 )
 
 var readyToggleConst = []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x02}
@@ -318,6 +458,22 @@ func rewriteSessionField(payload []byte, offset int, ip [4]byte, port uint16) []
 	binary.BigEndian.PutUint16(out[offset+2:offset+4], port)
 	copy(out[offset+4:offset+8], ip[:])
 	return out
+}
+
+// wrapperConnID extracts the 2-byte conn-ID from a "03 00 <seq> <conn-id>"
+// settings-sync wrapper (see this file's top-of-file "Protocol layering"
+// comment), if payload is shaped like one. Confirmed stable per-sender
+// for the life of a session across every capture this project has taken
+// (docs/directplay8-protocol.md, packet-handling-design.md) - used
+// 2026-08-12 onward to attribute an unprompted backend broadcast to the
+// right client by packet content (see session.connID,
+// relayBackendInitiated) instead of guessing by IP recency.
+func wrapperConnID(payload []byte) (id [2]byte, ok bool) {
+	if len(payload) < 6 || payload[0] != 0x03 || payload[1] != 0x00 {
+		return id, false
+	}
+	copy(id[:], payload[4:6])
+	return id, true
 }
 
 // discoveryRewrite returns a copy of payload with the sin_port/sin_addr
@@ -465,6 +621,12 @@ type config struct {
 	sessionListenAddr    string
 	sessionBackendAddr   string
 	statusListenAddr     string
+	// inputAgentAddr is input-agent's address (see input-agent/main.go) -
+	// unlike sessionBackendAddr, safe to point at the aom-headless-game
+	// Service's stable DNS name rather than the pod's raw IP, since these
+	// are plain client-initiated HTTP calls with no source-address
+	// matching requirement (see triggerMatchStart).
+	inputAgentAddr string
 	// verbose gates the hex-dump/per-packet debug logging below - it's
 	// synchronous, allocates a hex string per packet, and runs on every
 	// single packet including the high-frequency session-port ones, which
@@ -496,6 +658,7 @@ func loadConfig() config {
 	cfg.sessionListenAddr = getenv("SESSION_LISTEN_ADDR", ":2300")
 	cfg.sessionBackendAddr = getenv("SESSION_BACKEND_ADDR", "127.0.0.1:2300")
 	cfg.statusListenAddr = getenv("STATUS_LISTEN_ADDR", ":8080")
+	cfg.inputAgentAddr = getenv("INPUT_AGENT_ADDR", "aom-headless-game:8082")
 	cfg.verbose = getenv("VERBOSE", "") != ""
 	copy(cfg.publicIP[:], ip)
 
@@ -525,6 +688,20 @@ type session struct {
 
 	mu       sync.Mutex
 	lastSeen time.Time
+
+	// connID/connIDKnown record the backend's own wrapper conn-ID (see
+	// wrapperConnID) for this specific client relationship, learned the
+	// first time a "03 00"-wrapped packet is correctly attributed to
+	// this session via backendToClient's own per-client dialed-socket
+	// read (where sess is already known for certain, unlike
+	// relayBackendInitiated's guesswork). Added 2026-08-12 - see
+	// relayBackendInitiated's doc comment for why this exists: an
+	// unprompted backend broadcast (e.g. newPeerBroadcast) carries this
+	// same conn-ID, letting it be attributed to the right client by
+	// packet content instead of IP-recency guessing. Guarded by the mu
+	// field above, same as lastSeen.
+	connID      [2]byte
+	connIDKnown bool
 }
 
 // proxy is a generic per-client UDP session relay: one shared socket
@@ -554,8 +731,38 @@ type proxy struct {
 	backendUDPAddr *net.UDPAddr
 	tracker        *clientTracker
 
+	// onSessionRemoved, if set, is called whenever a client's session is
+	// torn down, however that happens - backendToClient's own read-error
+	// cleanup or reapIdleSessions' idle-timeout cleanup both call it, so
+	// callers get one consistent "this client is gone" signal regardless
+	// of which path caught it.
+	//
+	// Correction (2026-08-12): NOT currently wired to anything on
+	// sessionProxy - see that struct literal's own correction comment in
+	// main() for why firing pair-relay teardown from a plain idle-timeout
+	// broke the second client's join outright. Left as a hook for once a
+	// real departure signal exists, not removed.
+	onSessionRemoved func(clientAddr *net.UDPAddr)
+
 	mu       sync.Mutex
 	sessions map[string]*session
+}
+
+// closeSession forcibly closes and removes clientAddr's session, the
+// same effect as its backend connection erroring out naturally (that
+// existing path - backendToClient's own cleanup - is what actually does
+// the map removal and fires onSessionRemoved; this just triggers it).
+// Idempotent and safe to call on an already-gone session: a resign burst
+// arrives as roughly ten rapid duplicate packets (see isResignBurst), so
+// this will typically be called several times per real departure.
+func (p *proxy) closeSession(clientAddr *net.UDPAddr) {
+	p.mu.Lock()
+	sess, ok := p.sessions[clientAddr.String()]
+	p.mu.Unlock()
+	if !ok {
+		return
+	}
+	sess.backendConn.Close()
 }
 
 func (p *proxy) run() {
@@ -568,7 +775,20 @@ func (p *proxy) run() {
 		}
 		payload := append([]byte(nil), buf[:n]...)
 
-		if p.backendUDPAddr != nil && srcAddr.IP.Equal(p.backendUDPAddr.IP) && srcAddr.Port == p.backendUDPAddr.Port {
+		// Correction (2026-08-12): matched on IP *and* port until today;
+		// relaxed to IP-only after reproducing live a case where a
+		// backend-originated broadcast (newPeerBroadcast) never reached
+		// rewriteToClient at all - best explanation is the backend using
+		// a different local port for this message than the one normal
+		// per-client reply traffic uses (see relayBackendInitiated's doc
+		// comment), which the old exact-match check would silently
+		// misroute through forwardToBackend instead, treating the
+		// backend's own packet as a brand-new client. IP-only is safe
+		// here specifically because p.backendUDPAddr's IP is always the
+		// backend pod's own address, never a real client's (see
+		// clientTracker's doc comment on why real client addresses never
+		// reach the backend directly to begin with).
+		if p.backendUDPAddr != nil && srcAddr.IP.Equal(p.backendUDPAddr.IP) {
 			p.relayBackendInitiated(payload)
 			continue
 		}
@@ -589,6 +809,26 @@ func (p *proxy) sessionClientAddrForIP(ip net.IP) *net.UDPAddr {
 	defer p.mu.Unlock()
 	for _, sess := range p.sessions {
 		if sess.clientAddr != nil && sess.clientAddr.IP.Equal(ip) {
+			return sess.clientAddr
+		}
+	}
+	return nil
+}
+
+// sessionClientAddrForConnID returns the real client address of the
+// session whose learned backend conn-ID (session.connID, see
+// wrapperConnID) matches id, or nil if none is known yet. Added
+// 2026-08-12 as relayBackendInitiated's primary attribution method - see
+// that function's doc comment for why this is more reliable than the
+// IP-recency guessing it previously relied on exclusively.
+func (p *proxy) sessionClientAddrForConnID(id [2]byte) *net.UDPAddr {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, sess := range p.sessions {
+		sess.mu.Lock()
+		known := sess.connIDKnown && sess.connID == id
+		sess.mu.Unlock()
+		if known && sess.clientAddr != nil {
 			return sess.clientAddr
 		}
 	}
@@ -632,6 +872,42 @@ func (p *proxy) otherSessionClientAddr(skip *net.UDPAddr) *net.UDPAddr {
 	return nil
 }
 
+// pollOtherSessionClientAddr is otherSessionClientAddr, retried for up to
+// pollTimeout (checking every pollInterval) if no other session exists
+// yet.
+//
+// Added 2026-08-12 after reproducing live the race this exists to
+// survive: the host's address-broadcast messages (newPeerBroadcast/
+// existingPeerBroadcast) can arrive at this proxy before the other real
+// client's own session has been registered here yet - purely a timing
+// question on this proxy's side, since goroutine scheduling across the
+// discovery/session listeners gives no ordering guarantee even when the
+// underlying network events happened in a sensible order. Originally
+// handled by just logging the miss and forwarding the packet unmodified,
+// on the assumption the host would retry the broadcast shortly after
+// (observed happening in one earlier test). Confirmed live that the host
+// does NOT reliably retry: a real 2-client join reproduced this exact
+// miss with zero retry, permanently starving one client of the other's
+// address and reproducing the full 120s "Attempting to Connect" hang
+// this whole feature exists to prevent - even though the *other* client
+// (which didn't hit the race) correctly reached out hundreds of times
+// over the relay, all silently ignored by the client that never got
+// armed to expect them. Polling here means the callers can synthesize
+// the rewrite themselves the moment the session appears, instead of
+// depending on the host to resend anything.
+func (p *proxy) pollOtherSessionClientAddr(skip *net.UDPAddr, pollTimeout, pollInterval time.Duration) *net.UDPAddr {
+	deadline := time.Now().Add(pollTimeout)
+	for {
+		if other := p.otherSessionClientAddr(skip); other != nil {
+			return other
+		}
+		if time.Now().After(deadline) {
+			return nil
+		}
+		time.Sleep(pollInterval)
+	}
+}
+
 // relayBackendInitiated handles a packet the backend sent unprompted to
 // this proxy's listening socket (rather than as a reply on a per-client
 // dialed connection) - see clientTracker's doc comment for why the backend
@@ -640,8 +916,26 @@ func (p *proxy) otherSessionClientAddr(skip *net.UDPAddr) *net.UDPAddr {
 // well-known listening address regardless of which client it means, since
 // every client looks identical to it (same rewritten proxy address).
 //
+// Correction (2026-08-12): this used to be reached only for packets
+// matching p.backendUDPAddr's IP *and* port exactly; now IP-only (see
+// run()'s own correction comment) after reproducing live a
+// newPeerBroadcast that reached this proxy's listening socket from a
+// different local port than ordinary per-client reply traffic uses -
+// meaning this function now needs to handle a wider range of backend
+// traffic than before, including messages that DO know which client
+// they're for (their own wrapper conn-ID, see wrapperConnID) even though
+// this function previously had no way to know that.
+//
 // Picking the right client to relay to is therefore inferred, in order:
-//  1. Whichever real client most recently sent discovery-port traffic
+//  1. **Wrapper conn-ID match** (added 2026-08-12,
+//     sessionClientAddrForConnID) - if payload is "03 00"-wrapped, its
+//     conn-ID is protocol content the backend itself chose specifically
+//     to identify which client relationship this packet belongs to, not
+//     a guess. Confirmed stable per-sender across every capture this
+//     project has taken. Most reliable option when available; only
+//     available once at least one packet has been correctly attributed
+//     to that session already (see backendToClient, which learns it).
+//  2. Whichever real client most recently sent discovery-port traffic
 //     (clientTracker) - reliably whoever is currently mid-connect, since a
 //     client stops browsing/pinging once actually joined - matched by IP
 //     against this proxy's own sessions to find that same client's address
@@ -652,17 +946,22 @@ func (p *proxy) otherSessionClientAddr(skip *net.UDPAddr) *net.UDPAddr {
 //     docs/directplay8-protocol.md for the symptom this was causing: the
 //     backend's packets for a new client kept landing on an existing one
 //     instead).
-//  2. If no session matches that IP yet (the client hasn't sent its own
+//  3. If no session matches that IP yet (the client hasn't sent its own
 //     first packet on this port), any one existing session - correct by
 //     construction when there's only one, a reasonable guess otherwise.
-//  3. If there are no sessions at all, the tracker's raw address - wrong
+//  4. If there are no sessions at all, the tracker's raw address - wrong
 //     port, so effectively a no-op send, but harmless and better than
 //     dropping the packet outright (matches pre-fix behavior for the
 //     single-client bootstrap case).
 func (p *proxy) relayBackendInitiated(payload []byte) {
 	var clientAddr *net.UDPAddr
-	if recent := p.tracker.get(); recent != nil {
-		clientAddr = p.sessionClientAddrForIP(recent.IP)
+	if id, ok := wrapperConnID(payload); ok {
+		clientAddr = p.sessionClientAddrForConnID(id)
+	}
+	if clientAddr == nil {
+		if recent := p.tracker.get(); recent != nil {
+			clientAddr = p.sessionClientAddrForIP(recent.IP)
+		}
 	}
 	if clientAddr == nil {
 		clientAddr = p.anySessionClientAddr()
@@ -745,11 +1044,24 @@ func (p *proxy) backendToClient(key string, clientAddr *net.UDPAddr, sess *sessi
 			break
 		}
 
+		payload := buf[:n]
+
 		sess.mu.Lock()
 		sess.lastSeen = time.Now()
+		if !sess.connIDKnown {
+			// Learned here, not in relayBackendInitiated: this read loop
+			// is scoped to sess's own per-client dialed backendConn, so
+			// sess is known for certain, unlike relayBackendInitiated's
+			// guesswork - see session.connID's doc comment and
+			// relayBackendInitiated's own doc comment for why this
+			// mapping matters.
+			if id, ok := wrapperConnID(payload); ok {
+				sess.connID = id
+				sess.connIDKnown = true
+			}
+		}
 		sess.mu.Unlock()
 
-		payload := buf[:n]
 		if p.rewriteToClient != nil {
 			payload = p.rewriteToClient(payload, p.cfg, sess)
 		}
@@ -761,6 +1073,9 @@ func (p *proxy) backendToClient(key string, clientAddr *net.UDPAddr, sess *sessi
 	p.mu.Lock()
 	delete(p.sessions, key)
 	p.mu.Unlock()
+	if p.onSessionRemoved != nil {
+		p.onSessionRemoved(clientAddr)
+	}
 }
 
 func (p *proxy) reapIdleSessions() {
@@ -768,6 +1083,7 @@ func (p *proxy) reapIdleSessions() {
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
+		var removed []*net.UDPAddr
 		p.mu.Lock()
 		for key, sess := range p.sessions {
 			sess.mu.Lock()
@@ -776,10 +1092,16 @@ func (p *proxy) reapIdleSessions() {
 			if idle > idleTimeout {
 				sess.backendConn.Close()
 				delete(p.sessions, key)
+				removed = append(removed, sess.clientAddr)
 				log.Printf("[%s] closed idle session for client %s", p.name, key)
 			}
 		}
 		p.mu.Unlock()
+		if p.onSessionRemoved != nil {
+			for _, addr := range removed {
+				p.onSessionRemoved(addr)
+			}
+		}
 	}
 }
 
@@ -801,6 +1123,16 @@ func mustListen(addr string) *net.UDPConn {
 // client to the fixed AoM backend. See
 // docs/multi-peer-routing-design.md's "one dedicated relay port per
 // pair" section.
+//
+// No official-DP8 analog: this is pure proxy-side infrastructure, not
+// anything classic DirectPlay or [MC-DPL8CS]/[MC-DPL8R] know about or
+// need to. A dedicated per-pair relay port is this proxy's own answer to
+// a proxy-specific problem (see the type's own doc comment below for
+// why), invented to make newPeerBroadcast/existingPeerBroadcast's
+// rewritten addresses point somewhere that actually demultiplexes real
+// clients correctly - the protocol itself has no concept of a relay at
+// all, every peer in a genuine deployment just dials the other
+// directly.
 //
 // This is deliberately NOT built by reusing the proxy struct above.
 // proxy's model is asymmetric by design - one fixed backend, clients
@@ -832,6 +1164,11 @@ type pairRelay struct {
 	selfPort uint16
 	addrA    *net.UDPAddr
 	addrB    *net.UDPAddr
+	// onResign, if set, is called with a peer's address when a resign
+	// burst crosses this relay (see isResignBurst) - lets main() hook
+	// client<->client resign detection into the same session-teardown
+	// path as client<->host resign detection (see proxy.closeSession).
+	onResign func(peerAddr *net.UDPAddr)
 }
 
 // newPairRelay binds a fresh, dynamically-allocated port (never the
@@ -856,6 +1193,57 @@ func udpAddrEqual(a, b *net.UDPAddr) bool {
 	return a.IP.Equal(b.IP) && a.Port == b.Port
 }
 
+// isResignBurst reports whether payload matches the 3-byte "01 <connID>"
+// client resign/leave signature (see docs/directplay8-protocol.md's
+// "Client resign/leave signature" section) - sent as roughly ten rapid
+// identical copies per real resign event, so callers should be
+// idempotent (see closeSession/onClientGone). The trailing 2 bytes are
+// the sender's own connection ID, which varies per session, so only the
+// shape (3 bytes, leading 0x01) is matched, matching the doc's own
+// conclusion that this is a fixed-shape signal, not a fixed-value one.
+//
+// Likely official-DP8 analog for the *intended* signal (structural, not
+// byte-confirmed - see this file's top-of-file "Protocol layering"
+// comment): [MC-DPL8R] section 2.2.1.4 HARD_DISCONNECT - "used to
+// quickly disconnect... without waiting for remaining packets to be
+// delivered," a reliable-layer CFRAME, not an upper-layer message - a
+// plausible fit for a deliberately small, best-effort, repeatedly-sent
+// signal like this one. A second, equally plausible candidate for what
+// the *false-positive* case below might actually be:
+// [MC-DPL8R] section 3.1.6.6 KeepAlive - "a reliable data frame (DFRAME)
+// with no application payload," sent periodically whenever no other
+// traffic has flowed recently, restarted "after another period of
+// inactivity" on receipt of *any* valid packet. A periodic, otherwise-
+// unexplained fixed-shape message with no user action behind it (see the
+// 2026-08-11 correction below) is exactly what a KeepAlive would look
+// like if classic DirectPlay's own reliable layer has an equivalent -
+// worth checking directly against [MC-DPL8R]'s KeepAlive timing model
+// before assuming this shape is resign-specific at all.
+//
+// Correction (2026-08-11): matching on shape alone turned out to be
+// unsafe to *act* on. Live 2-real-client testing caught this exact
+// shape firing as a precise, repeating burst exactly 2 minutes after
+// every successful pairing (three cycles observed, each gap exactly
+// 2:00), with no user action behind it at all - not a resign, some
+// other periodic protocol message (a keepalive or re-sync tick?)
+// coincidentally matching the same "rapid burst of identical 3-byte
+// packets starting with 0x01" signature. The original capture this
+// function was based on only ever saw the burst once, right before a
+// confirmed clean stop - never checked whether the *shape* alone is
+// unique to that event or whether something else on a timer produces
+// the same shape. Turns out it isn't unique: acting on it (closing the
+// session) was killing every real match about 2 minutes in, reproducing
+// the exact "Attempting to Connect" hang the whole durability pass was
+// meant to fix. Both call sites now only log this, they don't close
+// anything - kept detecting (not removed) since the logging is useful
+// forensic data for whoever eventually captures a real resign to diff
+// against and find the actual distinguishing feature (a different
+// connID pattern? bracketed by different neighboring traffic? never
+// repeating exactly every 2 minutes?).
+func isResignBurst(payload []byte) bool {
+	return len(payload) == 3 && payload[0] == 0x01
+}
+
 // run reads every packet arriving on this relay's shared socket and
 // forwards it to whichever of addrA/addrB ISN'T the sender - rewriting
 // the session handshake's self/peer fields the same way sessionProxy
@@ -863,13 +1251,31 @@ func udpAddrEqual(a, b *net.UDPAddr) bool {
 // through the relay; peer -> the receiver's own real address, matching
 // what its own validation expects, per isSessionHandshake's doc comment)
 // - every other message type passes through unmodified.
+//
+// Also watches for a resign burst from either side (see isResignBurst)
+// and reports it via onResign, if set - this is the client<->client
+// half of departure detection (docs/multi-peer-routing-design.md's
+// "Durability" section); the client<->host half lives in sessionProxy's
+// rewriteToBackend. Unlike that direction, a resign burst crossing this
+// relay hasn't actually been confirmed in a real capture yet (see the
+// protocol doc's note that only client->host has been observed) - kept
+// here anyway since the shape check is cheap and this is the only place
+// that would ever see genuine client<->client resign traffic if it
+// exists.
+//
+// Returns (via the loop simply ending) once r.conn is closed - closing
+// the conn is how a caller tears this relay down (see
+// matchState.onClientGone), and ReadFromUDP returning an error on a
+// closed conn is the expected, only way this loop ever exits; it must
+// break rather than retry, or a closed conn would spin this goroutine
+// in a tight error-logging loop forever.
 func (r *pairRelay) run() {
 	buf := make([]byte, bufSize)
 	for {
 		n, src, err := r.conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Printf("[%s] read: %v", r.name, err)
-			continue
+			log.Printf("[%s] read: %v (relay stopping)", r.name, err)
+			return
 		}
 		payload := append([]byte(nil), buf[:n]...)
 
@@ -882,6 +1288,17 @@ func (r *pairRelay) run() {
 		default:
 			log.Printf("[%s] packet from unexpected sender %s (expected %s or %s), dropping", r.name, src, r.addrA, r.addrB)
 			continue
+		}
+
+		if isResignBurst(payload) {
+			// Logging only, NOT calling onResign - see isResignBurst's doc
+			// comment's 2026-08-11 correction. onResign is left wired to
+			// nothing for now (see ensurePairRelay) until this shape is
+			// properly confirmed as an actual resign in this direction too.
+			log.Printf("[%s] resign-shaped burst from %s seen (not acted on, see isResignBurst)", r.name, src)
+			if r.onResign != nil {
+				r.onResign(src)
+			}
 		}
 
 		out := payload
@@ -905,9 +1322,16 @@ func (r *pairRelay) run() {
 // concurrent matches, which is explicitly out of scope for now).
 type matchState struct {
 	cfg config
+	// closeSession is sessionProxy.closeSession, set once during main()'s
+	// wiring - handed to every pairRelay this match creates (as its
+	// onResign callback) so a client<->client resign burst tears down
+	// that client's session via the same path as a client<->host one.
+	closeSession func(clientAddr *net.UDPAddr)
 
-	mu   sync.Mutex
-	pair *pairRelay
+	mu      sync.Mutex
+	pair    *pairRelay
+	ready   map[string]bool // clientAddr.String() -> last-seen ready state
+	started bool            // guards against triggering match-start more than once
 }
 
 // ensurePairRelay returns the A<->B relay for this match, creating and
@@ -919,10 +1343,11 @@ type matchState struct {
 // matters), so the relay can be built directly with no per-client
 // discovery step.
 //
-// Not yet handled (see docs/multi-peer-routing-design.md's "Durability"
-// section): tearing this down when a player drops and rebuilding it for
-// whoever joins the vacated slot - today it's created once per proxy
-// lifetime and never replaced.
+// Not yet torn down and rebuilt on a player dropping - onClientGone
+// below exists to do that (docs/multi-peer-routing-design.md's
+// "Durability" section) but isn't currently wired to fire from anything
+// (see sessionProxy's construction in main() for why: firing it from a
+// plain idle timeout broke the second client's join outright).
 func (m *matchState) ensurePairRelay(selfAddr, otherAddr *net.UDPAddr) *pairRelay {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -930,9 +1355,56 @@ func (m *matchState) ensurePairRelay(selfAddr, otherAddr *net.UDPAddr) *pairRela
 		return m.pair
 	}
 	relay := newPairRelay("pair", m.cfg, selfAddr, otherAddr)
+	// NOT wiring relay.onResign to m.closeSession right now - see
+	// isResignBurst's doc comment's 2026-08-11 correction on why acting
+	// on this shape is currently disabled in both directions.
 	go relay.run()
 	m.pair = relay
 	return relay
+}
+
+// onClientGone tears down whatever this match knows about addr - the
+// scoped-teardown half of durability (docs/multi-peer-routing-design.md's
+// "Durability" section), meant to be the single place that reacts to a
+// departure regardless of cause.
+//
+// Correction (2026-08-12): not currently called from anywhere - see
+// sessionProxy's construction in main(). A previous wiring (fire this
+// from proxy.onSessionRemoved, covering both an eventual real resign
+// signal and the idle-timeout reaper) reproduced the exact "Attempting
+// to Connect" hang durability was meant to fix: the idle-timeout reaper
+// doesn't distinguish "client actually left" from "client's host-facing
+// traffic happened to go quiet because it's busy on the P2P leg
+// instead," and firing this function on the latter kills a pair relay
+// that's still needed - observed live, killing the second client's
+// handshake mid-attempt. Kept defined and ready to wire back up once
+// there's a real departure signal (a confirmed resign burst, not the
+// still-unconfirmed shape isResignBurst currently only logs).
+//
+// Deliberately scoped to just addr: if addr isn't part of the current
+// pair, this only removes its ready-state entry and does nothing to
+// m.pair, so the surviving client's own session (tracked entirely
+// separately, in sessionProxy.sessions) and its pairing are never
+// touched - isolation falls out of this function only ever acting on
+// the one address it's given, not from any global reset.
+//
+// m.started is deliberately NOT reset here: it guards against re-
+// triggering the host's Ready-crystal click, not connection lifecycle -
+// a reconnect after match-start shouldn't cause a second click into a
+// match already in progress.
+func (m *matchState) onClientGone(addr *net.UDPAddr) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.ready, addr.String())
+	if m.pair == nil {
+		return
+	}
+	if !udpAddrEqual(addr, m.pair.addrA) && !udpAddrEqual(addr, m.pair.addrB) {
+		return
+	}
+	log.Printf("[match] %s departed, tearing down pair relay", addr)
+	m.pair.conn.Close()
+	m.pair = nil
 }
 
 // full reports whether this match's A<->B pair relay has been created -
@@ -949,6 +1421,77 @@ func (m *matchState) full() bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.pair != nil
+}
+
+// hostReadyX/hostReadyY are the host's own Ready-crystal coordinates in
+// the 800x600 lobby screen - the same control a human host would click,
+// pixel-measured live 2026-08-11 (see docs/host-flow.md). Confirmed to
+// be the actual match-start trigger: with both real (or, in the
+// confirming test, AI) slots already showing ready, clicking this alone
+// started the match immediately - there is no separate "Start Game"
+// button.
+const (
+	hostReadyX = 511
+	hostReadyY = 89
+)
+
+// setReady records a real client's latest Ready-toggle state (see
+// isReadyToggle/readyToggleState) and reports whether both real clients
+// are now ready - "both" meaning exactly 2 distinct clients have ever
+// reported in, and every one of them currently reads ready, matching
+// this project's fixed 1v1 scope (see CLAUDE.md's Goals). A client that
+// un-readies after both were ready simply un-latches this - only a
+// fresh transition into "both ready" returns true, so a flapping toggle
+// doesn't retrigger every time it happens to land on ready again once
+// startTriggered has already fired (see startTriggered/markStarted).
+func (m *matchState) setReady(clientAddr *net.UDPAddr, ready bool) (bothReady bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.ready == nil {
+		m.ready = make(map[string]bool)
+	}
+	m.ready[clientAddr.String()] = ready
+	if len(m.ready) < 2 {
+		return false
+	}
+	for _, r := range m.ready {
+		if !r {
+			return false
+		}
+	}
+	return true
+}
+
+// markStarted reports whether match-start has already been triggered,
+// and marks it triggered if not - the guard that makes triggerMatchStart
+// fire at most once per proxy lifetime even if setReady keeps reporting
+// "both ready" (e.g. a client toggles ready off and back on again).
+func (m *matchState) markStarted() (alreadyStarted bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	alreadyStarted = m.started
+	m.started = true
+	return alreadyStarted
+}
+
+// triggerMatchStart asks input-agent (see input-agent/main.go) to click
+// the host's own Ready crystal, the confirmed match-start trigger. Plain
+// HTTP over the pod network - see the aom-headless-game Service's
+// input-agent port and its doc comment on why this doesn't need
+// SESSION_BACKEND_ADDR's pod-IP-pinning treatment.
+func triggerMatchStart(cfg config) {
+	url := fmt.Sprintf("http://%s/click?x=%d&y=%d", cfg.inputAgentAddr, hostReadyX, hostReadyY)
+	resp, err := http.Post(url, "", nil)
+	if err != nil {
+		log.Printf("triggerMatchStart: POST %s: %v", url, err)
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		log.Printf("triggerMatchStart: POST %s: unexpected status %s", url, resp.Status)
+		return
+	}
+	log.Printf("triggerMatchStart: clicked host Ready crystal (%d, %d)", hostReadyX, hostReadyY)
 }
 
 func main() {
@@ -1013,9 +1556,52 @@ func main() {
 		backendAddr:    cfg.sessionBackendAddr,
 		backendUDPAddr: sessionBackendUDPAddr,
 		tracker:        tracker,
+		// Correction (2026-08-12): NOT wiring onSessionRemoved to
+		// match.onClientGone anymore. It was, briefly, and that broke the
+		// second real client's join outright - reproduced live: the
+		// client<->host session for whichever client is mid-handshake can
+		// look idle to reapIdleSessions (idleTimeout, 30s) while that
+		// client is actually busy retrying its P2P handshake through the
+		// just-created pair relay, not sending much toward the host in
+		// that window. That idle reap fired onClientGone, which tore down
+		// the pair relay mid-handshake - and nothing ever rebuilds it,
+		// since the host has no reason to re-announce (our internal
+		// session churn is invisible to it - see clientTracker's doc
+		// comment on why the backend only ever sees this proxy's fixed
+		// address). Net effect: the second client's "Attempting to
+		// Connect" sat for the full 120s against a relay that had already
+		// been silently killed out from under it - the exact hang the
+		// durability pass was meant to prevent, reintroduced by the
+		// durability pass itself. A quiet host channel is not evidence a
+		// client left the match, especially not during its own handshake
+		// window - don't tear down the pair relay on it. onClientGone and
+		// closeSession are left in place (see matchState) for once a
+		// real, confirmed departure signal exists (see isResignBurst's
+		// own not-yet-confirmed status) - just not wired to fire from
+		// generic session removal until then.
 		rewriteToBackend: func(payload []byte, cfg config, sess *session) []byte {
+			if isResignBurst(payload) {
+				// Logging only, NOT closing the session - see isResignBurst's
+				// doc comment's 2026-08-11 correction. Real 2-real-client
+				// testing showed this exact shape fires on a precise 2-minute
+				// period after every successful pairing (e.g. 12:36:30 ->
+				// 12:38:30 -> 12:40:41 -> ..., each gap exactly 2:00), with no
+				// user action behind it - not a resign, some other periodic
+				// protocol message (keepalive/re-sync?) coincidentally
+				// matching the documented resign shape. Acting on it was
+				// killing healthy sessions ~2 minutes into every game,
+				// reproducing the exact "Attempting to Connect" hang this
+				// whole durability pass was meant to fix. Left logged (not
+				// removed) since it's useful forensic data for whoever
+				// eventually captures a real resign to compare against.
+				log.Printf("[session] client %s resign-shaped burst seen (not acted on, see isResignBurst)", sess.clientAddr)
+			}
 			if isReadyToggle(payload) {
-				log.Printf("[session] client %s ready-toggle: %v", sess.clientAddr, readyToggleState(payload))
+				ready := readyToggleState(payload)
+				log.Printf("[session] client %s ready-toggle: %v", sess.clientAddr, ready)
+				if match.setReady(sess.clientAddr, ready) && !match.markStarted() {
+					go triggerMatchStart(cfg)
+				}
 			}
 			if !isSessionHandshake(payload) {
 				if cfg.verbose {
@@ -1037,9 +1623,17 @@ func main() {
 		},
 		rewriteToClient: func(payload []byte, cfg config, sess *session) []byte {
 			if isNewPeerBroadcast(payload) {
-				other := sessionProxy.otherSessionClientAddr(sess.clientAddr)
+				// Polls rather than a one-shot lookup - see
+				// pollOtherSessionClientAddr's doc comment (2026-08-12):
+				// this can legitimately arrive before the other client's
+				// session is registered here yet, and the host does not
+				// reliably retry the broadcast if we just give up on the
+				// first miss. Blocks this client's own backendToClient
+				// read loop for at most otherSessionPollTimeout, which is
+				// fine - this message fires once, not on a hot path.
+				other := sessionProxy.pollOtherSessionClientAddr(sess.clientAddr, otherSessionPollTimeout, otherSessionPollInterval)
 				if other == nil {
-					log.Printf("[session] 0x29 new-peer broadcast to client %s but no other real client session found yet, forwarding unmodified", sess.clientAddr)
+					log.Printf("[session] 0x29 new-peer broadcast to client %s: no other real client session after polling %s, forwarding unmodified", sess.clientAddr, otherSessionPollTimeout)
 					return payload
 				}
 				relay := match.ensurePairRelay(sess.clientAddr, other)
@@ -1056,10 +1650,11 @@ func main() {
 				// ensurePairRelay/otherSessionClientAddr are already
 				// symmetric in self/other, so whichever of the two
 				// broadcasts arrives first creates the relay and the other
-				// just reuses it.
-				other := sessionProxy.otherSessionClientAddr(sess.clientAddr)
+				// just reuses it. Polls for the same race-survival reason
+				// as the 0x29 branch above.
+				other := sessionProxy.pollOtherSessionClientAddr(sess.clientAddr, otherSessionPollTimeout, otherSessionPollInterval)
 				if other == nil {
-					log.Printf("[session] existing-peer broadcast to client %s but no other real client session found yet, forwarding unmodified", sess.clientAddr)
+					log.Printf("[session] existing-peer broadcast to client %s: no other real client session after polling %s, forwarding unmodified", sess.clientAddr, otherSessionPollTimeout)
 					return payload
 				}
 				relay := match.ensurePairRelay(sess.clientAddr, other)
@@ -1089,6 +1684,7 @@ func main() {
 		},
 		sessions: make(map[string]*session),
 	}
+	match.closeSession = sessionProxy.closeSession
 
 	log.Printf("aom-lobby: discovery %s -> %s, session %s -> %s, public address %s:%d",
 		cfg.discoveryListenAddr, cfg.discoveryBackendAddr,

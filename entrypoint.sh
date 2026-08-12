@@ -26,4 +26,10 @@ if [ "${ENABLE_VNC:-0}" = "1" ]; then
     x11vnc -display "$DISPLAY" -forever -shared -nopw -quiet -bg
 fi
 
+# input-agent (see input-agent/main.go) - always on, unlike VNC's opt-in:
+# aom-lobby depends on it to drive host-side clicks in reaction to live
+# packet events (e.g. both real clients readying up), not just a
+# debugging aid.
+input-agent &
+
 exec "$@"

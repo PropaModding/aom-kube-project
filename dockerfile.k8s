@@ -1,3 +1,14 @@
+# input-agent runs inside this same image alongside Xvfb/wine (see
+# entrypoint.sh) - the network-callable primitive aom-lobby uses to drive
+# host-side clicks in reaction to live packet events (e.g. isReadyToggle
+# in lobby/main.go), as opposed to host-game-kube.sh's one-shot startup
+# sequence driven from outside the cluster. See input-agent/main.go.
+FROM golang:1.22-alpine AS input-agent-builder
+WORKDIR /src
+COPY input-agent/go.mod ./
+COPY input-agent/main.go ./
+RUN CGO_ENABLED=0 go build -o /input-agent .
+
 FROM debian:bullseye-slim
 
 # Headless AoM image meant to run as a Kubernetes pod with no host
@@ -57,6 +68,8 @@ RUN Xvfb :99 -screen 0 800x600x16 -ac -nolisten unix & \
     sleep 2 ; wineserver -k || true
 
 # 4. Finalise files & config
+COPY --from=input-agent-builder /input-agent /usr/local/bin/input-agent
+
 COPY --chown=aomuser:aomuser ./entrypoint.sh /home/aomuser/entrypoint.sh
 RUN chmod +x /home/aomuser/entrypoint.sh
 

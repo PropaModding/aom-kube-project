@@ -97,4 +97,47 @@ endpoint (host and every client) needs to believe every *other* endpoint
 is at the proxy's address, and the proxy needs to relay based on which
 real pair a given packet's DirectPlay connection ID belongs to, not
 just the current client<->host 1:1 relay. See the discussion in this
-session for the proposed approach; not yet implemented.
+session for the proposed approach - implemented 2026-08-10/2026-08-11,
+see `docs/multi-peer-routing-design.md`'s "Status" line and
+`lobby/main.go`.
+
+## Example packets (added 2026-08-12)
+
+Concrete instances of every message type these pcaps are referenced for
+elsewhere (`docs/directplay8-protocol.md`,
+`docs/directplay8-packet-classification.md`, `lobby/main.go`'s doc
+comments), with epoch timestamps (`frame.time_epoch` via `tshark -r
+<file> -T fields -e frame.time_epoch ...`) so they can be cross-checked
+against `clicks.log`-style epoch logs from other captures, or re-pulled
+from the pcaps directly. All times below are from `host-capture.pcap`
+unless noted; roles per the Setup section above (host=.3, clienta=.4,
+clientb=.5).
+
+| Epoch | Dir | Type | Bytes | Notes |
+|---|---|---|---|---|
+| 1786196564.959576 | clienta→bcast | `0x25` enumerate-hosts query | 9 | `25 00 00 00 00 00 00 00 00`, constant - matches `lobby/main.go`'s `discoveryQuery` exactly |
+| 1786196564.969803 | host→clienta | `0x26` discovery reply | 65 | Embeds host's address at offsets 5/21 (`lobby/main.go`'s `discoveryAddressOffsets`) - 65 here, not the 67 quoted elsewhere, since length varies with session-name string length |
+| 1786196627.366256 | clienta→host | `0x20` client ping | 41 | Same embedded-address shape as `0x26` minus the trailing name |
+| 1786196627.398726 | host→clienta | `0x21` ping reply | 41 | |
+| 1786196627.502457 | host→clienta | type `0x00` session handshake ("open") | 40 | `sessionSelfOffset`/`sessionPeerOffset` in `lobby/main.go` |
+| 1786196627.654138 | host→clienta | `07ff` heartbeat | 10 | |
+| 1786196628.204838 | host→clienta | session-name echo, undecoded sub-type | 45 | `03 00 <seq> <connid> 23 00 01 0d 00 0c 00 00 00 "host's Game"` - not yet formally catalogued anywhere; seen again in the 2026-08-12 live session under the same shape, worth a name if picked up again |
+| 1786196628.205017 | host→clienta | `0x29` new-peer broadcast, **empty variant** | 51 | Sub-header `15 01 00 00 00` (not the usual `1c 01 00 00 00`), embedded sockaddr all-zero (family=2, port=0, addr=0.0.0.0) - fires the moment clienta joins, before clientb exists to report. **Confirms this empty-variant shape is genuine protocol behavior**, not a proxy artifact - the same shape showed up independently in a 2026-08-12 live proxied test before being dismissed as possibly-stale capture data; it isn't, it's real. See `lobby/main.go`'s `isNewPeerBroadcast`. |
+| 1786196628.223645 | host→clienta | map-name sub-message | 139 | `docs/directplay8-protocol.md`'s "Post-handshake session-settings sync" section |
+| 1786196628.331592 | clienta→host | player-announce sub-message | 95 | GUID `{E9831C49-1FB0-488B-B4EE-261D1CC69463}`, nickname `client1` - 95 bytes here (not the 93 quoted elsewhere - nickname-length-dependent, as already flagged in `docs/directplay8-protocol.md`) |
+| 1786196650.403037 | host→clientb | session-name echo | 45 | Same shape as the 628.204838 entry, this time host→clientb |
+| 1786196650.403116 | host→**clientb** | **`existingPeerBroadcast`, full/valid variant** | 87 | Embeds clienta's real address (`192.168.49.4:2300`) at offsets 49/65 - the message found by re-examining this exact capture on 2026-08-10/2026-08-12 that closes the "new peer never learns the existing peer's address" gap. See `lobby/main.go`'s `existingPeerBroadcast` doc comment. |
+| 1786196650.403201 | host→clienta | `0x29` new-peer broadcast, **full/valid variant** | 51 | Embeds clientb's real address (`192.168.49.5:2300`) at offsets 13/29, sub-header `1c 01 00 00 00` - the "real" follow-up to the empty one at 628.205017, fired ~22s later once clientb has actually joined |
+| 1786196650.705389 | clientb→host | player-announce sub-message | 95 | GUID `{05153EBB-24BB-4FAE-9005-564EBD4E928D}`, nickname `client2` |
+| 1786196672.325925 | host→clienta | ready-toggle, **host→client direction** | 22 | Bool@19=1 (ready). Confirms `readyToggle` is not client→host-only as `lobby/main.go`'s current doc comment claims - the host also sends/echoes this shape to clients. Same timestamp (µs apart) as the clientb copy below, suggesting a host-driven broadcast rather than two independent client actions |
+| 1786196672.326314 | host→clientb | ready-toggle, host→client direction | 22 | Bool@19=1, same event as above |
+| 1786196677.023693 | clienta→host | ready-toggle, client→host direction | 22 | Bool@19=1 - the direction `lobby/main.go`'s `isReadyToggle` currently watches for |
+| 1786196679.190833 | clientb→host | ready-toggle, client→host direction | 22 | Bool@19=1 |
+| 1786196687.509557 | host→clienta | short map-name variant, undecoded sub-type | 69 | `03 00 <seq> <connid> 32 00 01 08 02 03 03 ...` then UTF-16LE `"Mediterranean.xs"` - a second, shorter map-related message distinct from the 139-byte one above; not yet formally catalogued |
+| 1786196734.696102 (×10, ~60µs apart) | host→clienta | `01 <connID>` resign/leave burst | 3 | `01 bc 66` - **this capture DOES contain the resign burst after all**, contradicting this file's original "Not captured this time" note below. Direction is host→clienta (not client→host as `docs/directplay8-protocol.md`'s "Client resign/leave signature" section documents from an earlier capture) - worth reconciling if the resign signature becomes relevant again, since `lobby/main.go`'s `isResignBurst` currently only watches the client→host direction on `sessionProxy` |
+
+The "Not captured this time" paragraph in the "Finding" section above
+predates this table and is now known to be wrong on that specific point
+- left as-is for the historical record rather than rewritten, per this
+project's usual practice of appending corrections rather than silently
+editing past findings.

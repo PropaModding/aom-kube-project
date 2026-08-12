@@ -12,6 +12,7 @@ spoofing DirectPlay 8 packets to support modern multiplayer hosting environments
 - `dockerfile.k8s` — headless AoM game pod image (no GPU/host X11/PulseAudio)
 - `dockerfile.lobby` — the Go lobby image
 - `lobby/` — the Go lobby: fake matchmaking front-end (see Architecture)
+- `input-agent/` — small Go HTTP server baked into `dockerfile.k8s`'s image, running alongside Xvfb/wine inside `aom-headless` itself; exposes `POST /click?x=&y=` (shells out to `xdotool`) so `aom-lobby` can trigger host-side clicks in reaction to live packet events (e.g. match-start once both real clients are ready) without needing k8s API/exec access of its own — see `docs/multi-peer-routing-design.md`'s "Ready-up automation" section
 - `k8s/` — Deployment/Service manifests for all of the above
 - `deploy-minikube.sh` — builds/applies everything into a local minikube cluster
 - `docs/directplay8-protocol.md` — reverse-engineered wire protocol findings

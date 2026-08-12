@@ -225,29 +225,86 @@ priority order:
    joined, with zero manual clicks or log-polling. See
    `docs/host-flow.md`'s "Flow (continued)" section for the full
    calibrated coordinates and confirmation screenshots.
-3. **Ready-up automation**: **packet found and detection wired up
-   2026-08-11** - see `docs/directplay8-protocol.md`'s "Ready-toggle
-   sub-message" section. A 22-byte client→host settings-sync message,
-   found by packet-length frequency analysis against a live 2-real-client
-   session (routine traffic is entirely 10/12/16 bytes; toggling Ready
-   reliably produced a single 22-byte outlier). `lobby/main.go`'s
+3. **Ready-up automation**: **done 2026-08-11**, end to end. The packet:
+   a 22-byte client→host settings-sync message, found by packet-length
+   frequency analysis against a live 2-real-client session (routine
+   traffic is entirely 10/12/16 bytes; toggling Ready reliably produced a
+   single 22-byte outlier) - see `docs/directplay8-protocol.md`'s
+   "Ready-toggle sub-message" section. `lobby/main.go`'s
    `isReadyToggle()`/`readyToggleState()` detect it and log
    `client %s ready-toggle: %v` on every toggle in either direction -
    confirmed live against both real clients, both ready and un-ready.
-   **Still to do**: driving the host's own response (starting the match)
-   once both real clients are ready - not built yet, and needs a way for
-   `aom-lobby` to actually command the pod (`kubectl exec ... xdotool`,
-   same mechanism `host-game-kube.sh` uses, but `aom-lobby` doesn't have
-   k8s API access today) once it knows both are ready. Also unconfirmed:
-   whether the host ever broadcasts a ready-state change back out to the
-   *other* real client (see the doc section's "Not yet checked" note) -
-   only client→host traffic was captured so far, since that's what a
-   host-side automation needs to react to.
-4. **Durability**: a client drops mid-match, a new client joins the
-   vacated slot - the original "Durability" section above still describes
-   the design (resign-signal detection + existing idle-timeout reap,
-   scoped teardown, clean re-fill), none of it built yet. Needs the
-   reference drop/rejoin capture this doc originally called for in step 1
-   above, still not taken. Per item 2's confirmation that Observer Mode
-   persists through a drop, no Observer Mode re-swap step is needed here -
-   just re-filling the vacated slot for whoever joins next.
+
+   Driving the host's own response needed a new piece: rather than give
+   `aom-lobby` k8s API/exec access (a real dependency jump for a UDP
+   proxy), a small HTTP server (`input-agent/`) now runs *inside* the
+   `aom-headless` container itself, alongside Xvfb/wine - see
+   `dockerfile.k8s`'s new builder stage and `entrypoint.sh`. It exposes
+   `POST /click?x=&y=` (shells out to `xdotool`, reachable at the
+   `aom-headless-game` Service's stable DNS name, port 8082 - safe to use
+   the Service rather than chase the pod's raw IP the way
+   `SESSION_BACKEND_ADDR` has to, since this is a plain client-initiated
+   HTTP call with no source-address matching requirement). `aom-lobby`'s
+   new `matchState.setReady()`/`markStarted()`/`triggerMatchStart()`
+   track both real clients' latest ready state and POST to input-agent
+   exactly once when both flip ready.
+
+   **The match-start trigger turned out to need no new UI exploration at
+   all**: confirmed live that there's no separate "Start Game" button -
+   the host has its own Ready crystal in the lobby's player list (same
+   control real clients use, at (511, 89) in the 800x600 layout, visible
+   even in Observer Mode), and clicking it once both other slots already
+   read ready starts the match immediately. Verified end-to-end with both
+   slots AI-filled (Standard) and the host's own crystal clicked via VNC -
+   the lobby screen was replaced by the actual match in progress.
+
+   **Still unconfirmed**: whether the host ever broadcasts a ready-state
+   change back out to the *other* real client (see
+   `docs/directplay8-protocol.md`'s "Not yet checked" note on this) - only
+   client→host traffic was captured so far, since that's what this
+   automation needed to react to.
+4. **Durability**: **done 2026-08-11**, built exactly to the design in
+   the original "Durability" section above - all three pieces:
+   - **Departure detection**: the fast path (`isResignBurst()` matching
+     the documented 3-byte `01 <connID>` shape) is built and detects in
+     both directions, but **is deliberately not wired to act on
+     anything** as of this writing - see `isResignBurst`'s doc comment's
+     2026-08-11 correction. Live 2-real-client testing caught this exact
+     shape firing as a precise, repeating burst exactly 2 minutes after
+     every successful pairing, with no user action behind it - not a
+     resign, some other periodic protocol message coincidentally matching
+     the same shape. Acting on it (the original implementation) was
+     closing every real session about 2 minutes into any match,
+     reproducing the exact "Attempting to Connect" hang this whole pass
+     was meant to fix. Both call sites now only log it (kept for forensic
+     value against a future real capture). **The slow path is what's
+     actually load-bearing today**: the existing `idleTimeout`/
+     `reapIdleSessions` mechanism (30s, unchanged) is the only active
+     departure-detection signal, wired through the same
+     `proxy.onSessionRemoved` hook that the fast path would also use once
+     it's trustworthy.
+   - **Scoped teardown**: `matchState.onClientGone(addr)` only ever acts
+     on the one address it's given - deletes its ready-state entry, and
+     tears down `m.pair` *only if* that address was actually part of it.
+     The surviving client's own session lives entirely in
+     `sessionProxy.sessions`, never touched by this - isolation is
+     structural, exactly as originally designed, not something the
+     teardown code has to be careful about separately.
+   - **Clean re-fill**: falls out for free from teardown being eager
+     (fires the moment a departure is detected) rather than lazy -
+     `ensurePairRelay` already sees `m.pair == nil` by the time a new
+     joiner's connection reaches the point where the host would broadcast
+     its address, so a fresh relay gets built with no ordering hacks
+     needed.
+
+   Found and fixed one real bug while building this: `pairRelay.run()`'s
+   read-error handling was `continue`, not `return` - closing a relay's
+   socket to tear it down would have busy-looped the goroutine forever
+   instead of stopping it. Fixed as a prerequisite.
+
+   Per item 2's confirmation that Observer Mode persists through a drop,
+   no Observer Mode re-swap step was needed on top of this. The reference
+   drop/rejoin capture this doc originally called for was never taken,
+   but real testing this session (repeatedly killing and relaunching
+   spoofed client containers mid-lobby) exercised the idle-timeout path
+   directly and is what surfaced the original bug this item fixes.

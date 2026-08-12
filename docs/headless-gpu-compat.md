@@ -9,6 +9,8 @@ exits → Kubernetes restarts the container → back to the EULA screen.
 
 ## Investigation
 
+is that what happened claude lol :)
+
 Killing and manually re-running the game inside the container isn't
 viable here — the container's PID 1 (`tini`) directly supervises the
 launched wine process, so killing it kills the container. Instead, the
