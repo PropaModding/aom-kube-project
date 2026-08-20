@@ -1,0 +1,63 @@
+# Confines aom-headless's own outbound reach to what it actually needs -
+# aom-lobby (the node's own address) and DNS - explicitly denying the
+# docker bridge subnet the spoofed test-client containers live on
+# (192.168.49.0/24, the "minikube" docker network - see
+# run-aom-spoofed-client.sh).
+#
+# Closes a real bypass found live 2026-08-14: a pod's own
+# 0x29/existingPeerBroadcast send could reach a client container
+# directly, skipping aom-lobby's rewrite entirely, because both happened
+# to share a network on this single dev machine - a real deployment has
+# no such adjacency at all (a cluster's pods have no route to a real
+# player's home network). See docs/multi-peer-routing-design.md and
+# archiving/sessions/ for this session's own notes on finding it.
+#
+# Requires a NetworkPolicy-enforcing CNI (minikube start --cni=calico) -
+# the default bridge CNI silently accepts and ignores this resource
+# entirely, which would be worse than not having it at all (false sense
+# of security). Verify enforcement with the same reachability checks
+# used to find the original bypass (kubectl exec into an aom-headless
+# pod, wget an arbitrary port on a client container's IP - should now
+# time out, not "connection refused").
+#
+# NODE_IP_PLACEHOLDER is substituted for the real minikube node IP by
+# deploy-minikube.sh (not known until the cluster exists - same reason
+# PUBLIC_ADDR gets patched in after the fact rather than hardcoded).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aom-headless-egress-lockdown
+spec:
+  podSelector:
+    matchLabels:
+      app: aom-headless
+  policyTypes:
+    - Egress
+  egress:
+    # Everything except the docker bridge subnet the spoofed test
+    # clients live on...
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 192.168.49.0/24
+    # ...then explicitly re-allow just aom-lobby's own address within
+    # that subnet. aom-lobby runs hostNetwork, bound to the node's real
+    # IP, which happens to sit in the same range the rule above denies -
+    # NetworkPolicy egress rules OR together, so this second rule punches
+    # back just the one address the first rule's exception took away,
+    # without reopening the rest of that subnet.
+    - to:
+        - ipBlock:
+            cidr: NODE_IP_PLACEHOLDER/32
+    # DNS - not currently needed by aom-headless at runtime (it never
+    # resolves a hostname; Xvfb/wine/aomxnocd1.exe/input-agent are all
+    # local), but cheap to allow and avoids surprising breakage for
+    # future debugging (kubectl exec + apt/curl, etc.).
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

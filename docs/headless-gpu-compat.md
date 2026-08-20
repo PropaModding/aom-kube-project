@@ -78,7 +78,9 @@ VideoPciDeviceID: 0x0402 -> 0x2562
 
 Confirmed fixed: both `aom-headless` and `aom-client` now reach the actual
 main menu and stay up (0 restarts), where before they crash-looped 100%
-of the time.
+of the time. (`aom-client` the k8s deployment was removed 2026-08-15 as
+unused - `run-aom-spoofed-client.sh`'s docker containers are the standard
+test-client approach now - but this fix applied to both at the time.)
 
 ## Why this matters beyond this one bug
 

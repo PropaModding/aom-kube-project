@@ -15,40 +15,53 @@ curl http://$(minikube ip):8080/full
 
 `/hosts` returns a single integer, newline-terminated (e.g. `1`) — the
 number of hosts currently answering as open. `/waiting` returns `true` or
-`false` — whether there's currently a game with a player (the host)
-waiting for an opponent, i.e. `/hosts` != 0. It's the signal matchmaking
-will use to decide whether a newly-connecting client can be routed into
-an existing game rather than provisioning a new pod (`hostProbe.
-hasWaitingGame()` in `lobby/main.go`) — round-robin across *multiple*
-waiting games is future work, see "Current scope" below. Since
+`false` — whether there's currently at least one game with a player (a
+host) waiting for an opponent, i.e. `/hosts` != 0. It's the signal
+matchmaking uses to decide whether a newly-connecting client can be
+routed into an existing game rather than a fresh one — see "N-host pool"
+below for what "routed into" actually means today (the real 3-tier
+"prefer a waiting host" policy, not plain round-robin). Since
 `aom-lobby` runs with `hostNetwork: true`, port 8080 is reachable
 directly at the minikube node's IP, same as UDP 2299/2300 — no separate
 `kubectl port-forward` needed, no auth.
 
-`/full` returns `true` or `false` — whether the match already has both
-real clients (host + 2 real clients, no open slots), the signal
-matchmaking needs to know a newly-connecting client should get a new pod
-rather than be routed into this one even though it might still show as
-"open" (see "How it decides full" below). Backed by `matchState.full()`
-in `lobby/main.go`.
+`/full` returns `true` or `false` — whether *every* host currently in the
+pool is full (host + 2 real clients, no open slots anywhere) - the
+meaningful pool-wide signal now that there can be more than one
+concurrent match, ANDed together across every `pool.hostFull(h)` in
+`lobby/main.go`. An empty pool (no `aom-headless` pods discovered yet
+or at all) also reports `true` - "no capacity anywhere" is accurate
+either way, even though the cause differs from every host being staffed.
 
 ## How it decides "full"
 
-Unlike `/hosts`/`/waiting`, `/full` isn't a periodic probe — it reflects
-whether the A<->B pair relay (`matchState.pair`, see
-`docs/multi-peer-routing-design.md`) has been created yet. That relay is
-only ever built once both real clients have connected *and* the host has
+Unlike `/hosts`/`/waiting`, a single host's "full" isn't a periodic
+probe — `hostPool.hostFull(h)` is true if *either* that host's own A<->B
+pair relay (`matchState.pair`, see `docs/multi-peer-routing-design.md`)
+has been created, *or* its real session count has reached the 2-client
+cap (`sessionCountForHost`) - the second check catches the case where
+both real clients have connected but the pair relay hasn't been built
+yet (a brief window right at pairing time). The pair relay is only ever
+built once both real clients have connected to *that host* *and* it has
 broadcast each one's address to the other (`ensurePairRelay`'s callers in
 `main.go`'s session `rewriteToClient`), so its existence is a direct,
-already-computed signal rather than a new one, and it's true exactly once
-the lobby is genuinely staffed — not merely "a client would be welcome to
-browse in," which is all `/hosts`/`/waiting` promise (a host can keep
-answering discovery queries for some time after both slots fill, since
-that's driven by whether the lobby screen is still open, not by slot
-count). There's no reset path yet: once true, `/full` stays true for the
-life of the pod, even if a player later drops — durability (tearing the
-relay down and rebuilding it for a reconnect) is still queued, see
-`docs/multi-peer-routing-design.md`'s "Next steps".
+already-computed signal rather than a new one, and it's true exactly
+once that host's lobby is genuinely staffed — not merely "a client would
+be welcome to browse in," which is all `/hosts`/`/waiting` promise (a
+host can keep answering discovery queries for some time after both slots
+fill, since that's driven by whether the lobby screen is still open, not
+by slot count).
+
+**There is a reset path**: once a real player is detected gone (30s
+dual-channel idle timeout, `reapIdleSessions` - see
+`docs/multi-peer-routing-design.md`'s Durability discussion),
+`matchState.onClientGone` tears the pair relay down and the session count
+drops, so `hostFull`/`/full` correctly flip back once a slot is genuinely
+free - confirmed live 2026-08-14/15 (a client dropped, was detected gone
+~38s later, and a replacement client correctly got routed back to the
+same host). The ~30-40s detection lag is real and by design (silence is
+the only signal available for a clean quit-to-menu today), not a gap in
+the reset logic itself.
 
 ## How it decides "open"
 
@@ -62,28 +75,43 @@ in an open, joinable lobby screen — mid-match or pre-hosting, there's no
 reply, so the count correctly drops to 0. This is implemented in
 `hostProbe` in `lobby/main.go`.
 
-## Current scope: one backend, so 0 or 1
+## N-host pool: `/hosts` can now be more than 1
 
-Today `aom-lobby` relays to a single static backend
-(`aom-headless-game`, see `k8s/lobby-deployment.yaml`), so `/hosts`
-only ever returns `0` or `1`, and `hasWaitingGame()`/`/waiting` just
-mirrors that same single probe's state. Per CLAUDE.md's Architecture
-intention, matches will eventually be provisioned on demand across
-multiple `aom-headless` pods with the lobby routing between them — at
-that point `hostProbe` becomes a set of probes (one per known backend)
-summed together for `/hosts`, and matchmaking will need to pick a
-*specific* waiting probe to route a client into (round-robin or
-otherwise) rather than just a yes/no across all of them — that's why
-`hasWaitingGame()` is kept as its own method on `hostProbe` rather than
-folded into `count()`. Nothing about the `/hosts`/`/waiting` APIs
-themselves needs to change for that; only what feeds them does.
+**Updated 2026-08-13**: `aom-lobby` no longer relays to a single static
+backend. It discovers every `aom-headless` pod dynamically via the
+Kubernetes API (`podLister` in `lobby/main.go`, polling every 3s, same
+cadence as `hostProbe`'s own liveness check) and gives each one its own
+independent probe, match state, and pair relay. Adding a host is just:
+
+```
+kubectl scale deployment/aom-headless --replicas=2
+```
+
+No manifest edits, no `aom-lobby` redeploy - `/hosts` picks up the new
+pod within one poll interval once it's self-hosted (every pod now hosts
+*itself* on startup via `auto-host.sh`, see `docs/host-flow.md`).
+
+Client-to-host assignment (`hostPool.selectLocked`) follows
+`lobby/packet-handling-design.md`'s 3-tier priority: prefer a host
+already waiting for a second player, then an empty host, then
+ineligible - "fill an open match before starting a new one," round-robin
+within whichever tier has candidates. Sticky per real client IP for the
+life of that client's connection either way (see that method's own doc
+comment). **Not built yet**: the claim/reservation race guard for two
+clients connecting within the same few seconds, and a spoofed "lobby
+full" rejection when no host is eligible (still blocked on a reference
+capture that's never been taken - a full pool today just silently drops
+a turned-away client's query).
 
 ## Config
 
 | Env var | Default | Meaning |
 |---|---|---|
 | `STATUS_LISTEN_ADDR` | `:8080` | Address the status HTTP server binds |
+| `AOM_HEADLESS_NAMESPACE` | `default` | Namespace `podLister` lists pods in |
+| `AOM_HEADLESS_LABEL_SELECTOR` | `app=aom-headless` | Label selector `podLister` lists pods with - must match `k8s/aom-headless-deployment.yaml`'s pod template label |
 
-Probe interval (3s) and per-probe timeout (1s) are currently constants
-in `lobby/main.go` (`probeInterval`, `probeTimeout`), not env-configurable
-— revisit if a deployment needs different tuning.
+Probe interval (3s), per-probe timeout (1s), and the pod-list poll
+interval (3s, `podPollInterval`) are currently constants in
+`lobby/main.go`, not env-configurable — revisit if a deployment needs
+different tuning.

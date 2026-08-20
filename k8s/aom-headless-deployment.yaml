@@ -3,6 +3,24 @@
 # validates the image will actually run on a GPU-less cloud node pool (AKS
 # included) rather than quietly depending on hardware only present on a dev
 # box.
+#
+# N-host update (2026-08-13): `replicas` is now the actual "how many hosts"
+# knob - `kubectl scale deployment/aom-headless --replicas=N` is the entire
+# operation for adding/removing hosts, no other manifest or lobby change
+# needed. This only works because aom-lobby now discovers backend pods
+# dynamically via the Kubernetes API (lobby/main.go's podLister, granted
+# read-only pod list/watch access by k8s/lobby-rbac.yaml) instead of being
+# told about a fixed address through static config - see
+# lobby/packet-handling-design.md's "N-host round-robin matchmaking"
+# section. Each replica already gets its own pod IP from the cluster
+# network for free; that's what made per-host duplication of this whole
+# file unnecessary once aom-lobby stopped needing to be told addresses
+# upfront.
+#
+# Every pod also hosts *itself* into a joinable lobby on startup now
+# (auto-host.sh, backgrounded by entrypoint.sh alongside input-agent) -
+# no external `host-game-kube.sh` run needed either. Scaling up really is
+# just the one `kubectl scale` command.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -10,7 +28,7 @@ metadata:
   labels:
     app: aom-headless
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: aom-headless
@@ -19,11 +37,20 @@ spec:
       labels:
         app: aom-headless
     spec:
-      # No hostNetwork here anymore: the node's real 2299/2300 now belong to
+      # No hostNetwork here: the node's real 2299/2300 belong to
       # aom-lobby (see k8s/lobby-deployment.yaml), which sits in front of
-      # this pod and rewrites/relays traffic to it via the
-      # aom-headless-game Service below. This pod only needs a normal,
-      # in-cluster pod IP.
+      # every aom-headless pod and rewrites/relays traffic to whichever
+      # one a given client was matched to. This pod only needs a normal,
+      # in-cluster pod IP - aom-lobby finds it via the Kubernetes API
+      # (see this file's own top comment), not a Service. No Service is
+      # defined for the game ports or VNC here anymore - a ClusterIP
+      # Service load-balances per-connection across every replica behind
+      # it, which is actively wrong once there's more than one pod:
+      # aom-lobby needs to address a *specific* pod, not "one of them,
+      # whichever". For VNC access to a specific pod (e.g. re-calibrating
+      # coordinates, or watching host-game-kube.sh drive a manual re-host
+      # - see docs/host-flow.md), port-forward the pod directly:
+      #   kubectl port-forward pod/<name> 5901:5900
       containers:
         - name: aom
           image: aom-k8s:latest
@@ -78,47 +105,3 @@ spec:
             limits:
               cpu: "2"
               memory: "2Gi"
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: aom-headless-vnc
-spec:
-  selector:
-    app: aom-headless
-  ports:
-    - name: vnc
-      port: 5900
-      targetPort: 5900
-  type: ClusterIP
----
-# Stable in-cluster address for the real pod's DirectPlay8 ports, so
-# aom-lobby doesn't have to chase pod IPs across restarts. Also carries
-# input-agent's TCP port: unlike SESSION_BACKEND_ADDR (deliberately
-# pinned to the pod's raw IP - see deploy-minikube.sh - since the session
-# proxy's backend-initiated-relay logic matches on that traffic's real
-# source address), aom-lobby's calls to input-agent are plain client-
-# initiated HTTP requests with no such constraint, so there's no reason
-# not to use this Service's stable DNS name instead of chasing the pod IP
-# the same way SESSION_BACKEND_ADDR has to.
-apiVersion: v1
-kind: Service
-metadata:
-  name: aom-headless-game
-spec:
-  selector:
-    app: aom-headless
-  ports:
-    - name: dp8-discovery
-      port: 2299
-      targetPort: 2299
-      protocol: UDP
-    - name: dp8-session
-      port: 2300
-      targetPort: 2300
-      protocol: UDP
-    - name: input-agent
-      port: 8082
-      targetPort: 8082
-      protocol: TCP
-  type: ClusterIP

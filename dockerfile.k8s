@@ -73,6 +73,12 @@ COPY --from=input-agent-builder /input-agent /usr/local/bin/input-agent
 COPY --chown=aomuser:aomuser ./entrypoint.sh /home/aomuser/entrypoint.sh
 RUN chmod +x /home/aomuser/entrypoint.sh
 
+# auto-host.sh (see that script) - self-hosts this pod at startup, no
+# external kubectl exec needed. Installed on PATH the same way
+# input-agent is above, so entrypoint.sh can call it bare.
+COPY --chown=aomuser:aomuser ./auto-host.sh /usr/local/bin/auto-host.sh
+RUN chmod +x /usr/local/bin/auto-host.sh
+
 COPY --chown=aomuser:aomuser ./aom_files /home/aomuser/aom
 WORKDIR /home/aomuser/aom
 

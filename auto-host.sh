@@ -1,48 +1,32 @@
 #!/bin/bash
-# Clicks an already-running aom-headless pod through to a hosted LAN/Direct-IP
-# lobby, using xdotool run in-container via `kubectl exec` (no screenshot
-# tool needed in-container - that's what made the original host-game.sh a
-# dead end, see docs/host-flow.md). Coordinates below were calibrated by
-# hand over VNC against dockerfile.k8s's fixed 800x600 display.
+# Clicks this pod's own aom-headless instance through to a hosted LAN/
+# Direct-IP lobby, using xdotool directly against the local DISPLAY - no
+# kubectl, no pod lookup, because this runs *inside* the container it's
+# driving (started backgrounded by entrypoint.sh, alongside input-agent).
 #
-# Superseded for routine use by auto-host.sh (repo root), which runs this
-# exact sequence *inside* the pod itself, backgrounded from entrypoint.sh
-# alongside input-agent - every aom-headless pod now self-hosts on
-# startup with zero external trigger, so `kubectl scale
-# deployment/aom-headless --replicas=N` alone is enough to add hosts. This
-# script is kept for its original purpose: manual/debug re-runs against a
-# specific already-running pod (e.g. watching the clicks live over VNC, or
-# forcing a re-host on a pod that somehow didn't self-host) - not part of
-# the automated path anymore.
+# This is host-game-kube.sh's exact calibrated click sequence, ported to
+# run locally instead of through `kubectl exec` - see that script for the
+# full history of how each coordinate/delay was calibrated (docs/
+# host-flow.md). The two scripts are meant to stay in lock-step: this one
+# is what makes a pod self-host as part of its own startup (so
+# `kubectl scale deployment/aom-headless --replicas=N` alone is enough to
+# add hosts, no external trigger needed); host-game-kube.sh remains for
+# manual/debug re-runs against an already-running pod (e.g. watching over
+# VNC, or forcing a re-host on a pod that somehow didn't self-host).
 #
-# Usage: ./host-game-kube.sh [nickname]
-#   nickname defaults to AOMHOST. AoM only accepts alphanumeric characters
-#   here - no symbols (confirmed by trial: "AOM-HOST" was rejected).
-#   For manual/live-debug runs (watching over Remmina/VNC), "TheIP" is the
-#   nickname convention in use - named after the thing a client actually
-#   needs to know (the cluster's Direct-IP address), easy to recognize in
-#   the lobby's own player list while debugging. e.g. ./host-game-kube.sh TheIP
-#
-# Leaves the pod sitting in the hosted lobby (game name "<nickname>'s
-# Game", default map/settings), host already in Observer Mode with both
-# slots open for real clients - see docs/host-flow.md for how the
-# AI-fill/Observer-Mode/kick sequence was calibrated. Not started here
-# either: this only gets the lobby open for players to join, same as the
-# manual VNC flow would.
-#
-# Assumes the pod is fresh (just past the game window appearing) or at
-# worst already sitting at the real Main Menu - after the EULA, the intro
-# splash(es) resolve straight to the real Main Menu (Learn to Play /
-# Campaign / Single Player / Multiplayer / Options / More / Exit) with no
-# separate landing screen in between - see docs/host-flow.md.
-#
-# To watch the clicks live while debugging: in one terminal,
-#   kubectl port-forward pod/<name> 5901:5900   # see $POD below, or `kubectl get pods -l app=aom-headless`
-# then, from your desktop:
-#   remmina -c vnc://localhost:5901
+# Usage: nickname is fixed at "TheIP" (the manual-debug convention
+# host-game-kube.sh's own doc comment already established - named after
+# the thing a client actually needs to know, the cluster's Direct-IP
+# address), not derived per-pod - every self-hosted pod's lobby shows the
+# same session name. That's fine: aom-lobby's own N-host routing keys
+# everything off each pod's real IP (see lobby/main.go's hostCandidate/
+# hostPool), never off the session name, so this has no effect on
+# correctness - only on how a human tells two hosts apart while watching
+# logs/captures, which live packet inspection can still do via source IP.
+# Override with HOST_NICKNAME if that ever matters.
 set -uo pipefail
 
-NICKNAME="${1:-AOMHOST}"
+NICKNAME="${HOST_NICKNAME:-TheIP}"
 GAME_WINDOW_PATTERN="${GAME_WINDOW_PATTERN:-Age of Mythology}"
 WINDOW_WAIT_TIMEOUT="${WINDOW_WAIT_TIMEOUT:-60}"
 # Long by default: aomxnocd1.exe runs pegged near 100% CPU under
@@ -55,15 +39,10 @@ STEP_DELAY="${STEP_DELAY:-5}"
 TYPE_DELAY_MS="${TYPE_DELAY_MS:-200}"
 APP_SETTLE_DELAY="${APP_SETTLE_DELAY:-10}"
 
-POD="$(kubectl get pod -l app=aom-headless -o jsonpath='{.items[0].metadata.name}')"
-if [ -z "$POD" ]; then
-    echo "No aom-headless pod found (kubectl get pod -l app=aom-headless)." >&2
-    exit 1
-fi
-echo "[*] Target pod: $POD"
+echo "[*] auto-host: self-hosting this pod ($(hostname)) as \"${NICKNAME}'s Game\""
 
 xdo() {
-    kubectl exec "$POD" -- xdotool "$@"
+    xdotool "$@"
 }
 
 click() {
@@ -78,7 +57,7 @@ waited=0
 until WIN="$(xdo search --name "$GAME_WINDOW_PATTERN" 2>/dev/null | head -n1)" && [ -n "$WIN" ]; do
     waited=$((waited + 2))
     if [ "$waited" -ge "$WINDOW_WAIT_TIMEOUT" ]; then
-        echo "Game window never appeared." >&2
+        echo "auto-host: game window never appeared, giving up." >&2
         exit 1
     fi
     sleep 2
@@ -195,6 +174,5 @@ click 37 115 "kick slot 2 AI (reopen for a real client)"
 click 37 143 "kick slot 3 AI (reopen for a real client)"
 
 echo
-echo "Done - $POD should now be hosting \"${NICKNAME}'s Game\" with 3 Players"
+echo "[*] auto-host: done - this pod should now be hosting \"${NICKNAME}'s Game\" with 3 Players"
 echo "(host in Observer Mode, 2 open slots for real clients)."
-echo "Next: have clients Direct-Connect and Join."

@@ -60,16 +60,24 @@ package main
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf16"
 )
 
 const (
@@ -212,7 +220,6 @@ const (
 // part that's wrong.
 const (
 	newPeerWrapperType0  = 0x03
-	newPeerWrapperType1  = 0x00
 	newPeerSubType0      = 0x29
 	newPeerSubType1      = 0x00
 	newPeerSubTypeOffset = 6 // right after the 6-byte 03 00/seq/conn-id wrapper
@@ -231,11 +238,24 @@ const (
 // isNewPeerBroadcast reports whether payload is a session-port (0x03
 // wrapper) settings-sync message with the nested 0x29 sub-type - see
 // newPeerBroadcast above.
+//
+// Correction (2026-08-20): this used to also require payload[1] == 0x00,
+// on the assumption the wrapper's second byte was a fixed part of the
+// "type" marker. It isn't - see docs/directplay8-protocol.md's "Common
+// wrapper" correction for the full evidence (seq, at bytes 2-3,
+// increments perfectly independent of byte 1's value; connection ID
+// stays fixed at bytes 4-5 regardless of it too). Requiring it silently
+// dropped genuine 0x29 broadcasts whenever byte 1 happened to be
+// nonzero - confirmed via a live node-level capture showing the real
+// host sending one with byte 1 = 0x33, and the exact same failure
+// already present, undetected, in the archived 2026-08-12 baseline this
+// project has always cited as "confirmed working." Only byte 0 and the
+// subtype are load-bearing for identifying this message.
 func isNewPeerBroadcast(payload []byte) bool {
 	if len(payload) < newPeerBroadcastMinLen {
 		return false
 	}
-	return payload[0] == newPeerWrapperType0 && payload[1] == newPeerWrapperType1 &&
+	return payload[0] == newPeerWrapperType0 &&
 		payload[newPeerSubTypeOffset] == newPeerSubType0 && payload[newPeerSubTypeOffset+1] == newPeerSubType1
 }
 
@@ -258,6 +278,21 @@ func rewriteNewPeerBroadcast(payload []byte, relayIP [4]byte, relayPort uint16) 
 	out := rewriteSessionField(payload, newPeerAddrOffset1, relayIP, relayPort)
 	return rewriteSessionField(out, newPeerAddrOffset2, relayIP, relayPort)
 }
+
+// newPeerBroadcastTemplate/existingPeerBroadcastTemplate and the
+// startNewPeerWatchdog synthesis fallback that used them were removed
+// 2026-08-20. They existed to paper over the genuine 0x29/
+// existingPeerBroadcast apparently never arriving for some clients -
+// resolved that same day: it always arrived, but isNewPeerBroadcast/
+// isExistingPeerBroadcast wrongly required the wrapper's byte 1 to be
+// 0x00, which isn't a real constant (see docs/directplay8-protocol.md's
+// "Common wrapper" correction) and silently rejected the genuine message
+// whenever it wasn't. With that detection fixed, the reactive rewrite
+// path (rewriteToClient's isNewPeerBroadcast/isExistingPeerBroadcast
+// branches, a few dozen lines below) catches every real broadcast
+// directly - no synthesized fallback needed. See
+// docs/multi-peer-routing-design.md's "Update (2026-08-20)" section for
+// the full investigation.
 
 // existingPeerBroadcast is the settings-sync sub-message counterpart to
 // newPeerBroadcast above, going the *other* direction: the host sends
@@ -312,23 +347,18 @@ func rewriteNewPeerBroadcast(payload []byte, relayIP [4]byte, relayPort uint16) 
 // timed with the new peer's own join) matches regardless of which side
 // carries the address bytes.
 //
-// 2026-08-12 (unresolved as of this writing): a live 2-client
-// join reproducibly shows a same-shaped 51-byte 0x29 packet reaching the
+// 2026-08-12 (was unresolved when written): a live 2-client join
+// reproducibly showed a same-shaped 51-byte 0x29 packet reaching the
 // EXISTING peer's own network interface with this proxy's rewrite never
-// having touched it (confirmed via full aom-lobby log inspection: zero
-// matching log lines, and every code path that writes to a client here
-// unconditionally logs on this branch) - i.e. traffic that appears to
-// bypass this process's socket entirely, most likely the backend pod
-// sending directly to the recorded (broken/constant) address via its
-// pod-network default route, something only possible because this
-// project's local test topology colocates the pod network and the
-// docker bridge network on one machine - a real deployment's backend pod
-// would have no route to a real player's internet address at all. Not
-// yet confirmed root-caused; see the 2026-08-12 session notes/commit
-// history for the live debugging trail if picking this up.
+// having touched it, theorized at the time as the backend pod bypassing
+// this process's socket entirely via a raw pod-network route. **Resolved
+// 2026-08-20, and that theory was wrong**: it wasn't a bypass at all -
+// the packet genuinely arrived at this process's own socket every time,
+// but isNewPeerBroadcast/isExistingPeerBroadcast's byte-1 check silently
+// rejected it. See docs/directplay8-protocol.md's "Common wrapper"
+// correction for the full evidence trail.
 const (
 	existingPeerWrapperType0 = 0x03
-	existingPeerWrapperType1 = 0x00
 
 	// Absolute offsets into the raw packet of the two back-to-back
 	// sockaddr_in blocks carrying the existing peer's address.
@@ -354,7 +384,9 @@ func isExistingPeerBroadcast(payload []byte) bool {
 	if len(payload) != existingPeerBroadcastLen {
 		return false
 	}
-	if payload[0] != existingPeerWrapperType0 || payload[1] != existingPeerWrapperType1 {
+	// byte 1 is deliberately not checked here - see this const block's
+	// own 2026-08-20 correction and isNewPeerBroadcast's doc comment.
+	if payload[0] != existingPeerWrapperType0 {
 		return false
 	}
 	return binary.LittleEndian.Uint16(payload[existingPeerAddrOffset1:existingPeerAddrOffset1+2]) == 2 &&
@@ -368,6 +400,56 @@ func isExistingPeerBroadcast(payload []byte) bool {
 func rewriteExistingPeerBroadcast(payload []byte, relayIP [4]byte, relayPort uint16) []byte {
 	out := rewriteSessionField(payload, existingPeerAddrOffset1, relayIP, relayPort)
 	return rewriteSessionField(out, existingPeerAddrOffset2, relayIP, relayPort)
+}
+
+// synthesizeLobbyFullRejection builds the packet a joiner's client needs
+// to display "Error Joining: Host game is full" - see
+// lobby/packet-handling-design.md's "Case 3 in detail" section for the
+// confirmed 2026-08-15 capture this is built from
+// (archiving/sessions/20260815-*-lobby-full-rejection/). connID here is
+// NOT the client's own connID (unlike the new-peer-broadcast watchdog's
+// use of session.connID) - a wrapper's conn-ID identifies its *sender*
+// (confirmed against the capture: the real rejection used the host's
+// own connID, "6f11", not the joiner's "e7f5"), and aom-lobby is the
+// sender here, impersonating a host it has no real backend for. So this
+// is an arbitrary value aom-lobby invents and stays consistent about,
+// not one learned from anything - see fakeHostConnID. seq is this
+// synthesized message's own sequence number in the (fake) exchange with
+// this client - 0 if this is the first (and, for now, only) synthesized
+// message sent, matching a rejection-only attempt with no preamble.
+//
+// Resolved (2026-08-15/16): yes, this needs to be preceded by a
+// synthesized 0x00 self/peer-open + 0x02 ack + name-broadcast exchange
+// (what a real host's rejection was preceded by in the reference
+// capture) - rejection-only, sent as an immediate reply with no
+// preamble, was tried first and confirmed NOT to work live (client sat
+// in "Attempting to Connect" indefinitely). simulateSessionPacket +
+// beginSimulatedHostOpen/beginSimulatedNameBroadcast build that full
+// preceding exchange today. The 13-byte field this builds (`22 07` then
+// 11 zero bytes) plus 2 further trailing zero bytes is copied
+// byte-for-byte from the real capture - not decoded further than "this
+// is the rejection," doesn't need to be understood to be reproduced
+// correctly.
+// fakeHostConnID is the arbitrary, self-chosen connID aom-lobby uses
+// whenever it needs to impersonate a host it has no real backend for -
+// see synthesizeLobbyFullRejection's own doc comment on why this is
+// invented rather than learned. Any consistent value should work as
+// well as any other (the real capture's own "6f11" is itself just
+// whatever the game engine happened to assign, not a meaningful
+// protocol constant) - picked to be visually distinct in a hex dump
+// from real captured examples, not for any deeper reason.
+var fakeHostConnID = [2]byte{0xfa, 0xed}
+
+func synthesizeLobbyFullRejection(connID [2]byte, seq uint16) []byte {
+	payload := []byte{
+		0x03, 0x00, 0x00, 0x00, 0x00, 0x00, // wrapper: type, seq (patched below), conn-id (patched below)
+		0x0d, 0x00, // length prefix = 13
+		0x22, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // 13-byte field the length prefix declares
+		0x00, 0x00, // 2 trailing bytes beyond the declared length, present in the real capture
+	}
+	binary.LittleEndian.PutUint16(payload[2:4], seq)
+	copy(payload[4:6], connID[:])
+	return payload
 }
 
 // readyToggle is the client->host settings-sync sub-message a client
@@ -416,11 +498,15 @@ var readyToggleConst = []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x02}
 
 // isReadyToggle reports whether payload is a session-port (0x03 wrapper)
 // settings-sync message matching readyToggle's shape above.
+//
+// byte 1 deliberately not checked - see isNewPeerBroadcast's 2026-08-20
+// doc comment; it isn't part of a fixed type marker and requiring it
+// drops genuine matches whenever it's nonzero.
 func isReadyToggle(payload []byte) bool {
 	if len(payload) != readyToggleLen {
 		return false
 	}
-	if payload[0] != newPeerWrapperType0 || payload[1] != newPeerWrapperType1 {
+	if payload[0] != newPeerWrapperType0 {
 		return false
 	}
 	if payload[readyToggleSubTypeOffset] != readyToggleSubType0 ||
@@ -468,8 +554,11 @@ func rewriteSessionField(payload []byte, offset int, ip [4]byte, port uint16) []
 // 2026-08-12 onward to attribute an unprompted backend broadcast to the
 // right client by packet content (see session.connID,
 // relayBackendInitiated) instead of guessing by IP recency.
+//
+// byte 1 deliberately not checked - see isNewPeerBroadcast's 2026-08-20
+// doc comment.
 func wrapperConnID(payload []byte) (id [2]byte, ok bool) {
-	if len(payload) < 6 || payload[0] != 0x03 || payload[1] != 0x00 {
+	if len(payload) < 6 || payload[0] != 0x03 {
 		return id, false
 	}
 	copy(id[:], payload[4:6])
@@ -500,6 +589,302 @@ func discoveryRewrite(payload []byte, cfg config) []byte {
 	return out
 }
 
+// simulatedFullLobbyGameName is the game name shown in the fake 0x26
+// reply synthesizeEmptyPoolDiscoveryReply builds - sent whenever a
+// client hits the "no eligible host" path in forwardToBackend. Named
+// after host-flow.md's own "TheIP" nickname convention for the real
+// auto-hosted lobby, so it looks consistent with a genuine one.
+const simulatedFullLobbyGameName = "TheIP's Game"
+
+// ourOwnSinZero is the sin_zero pattern aom-lobby uses whenever it
+// builds a sockaddr block describing its OWN address (host
+// impersonation) - see synthesizedSockaddr's doc comment for why this
+// is safe to leave arbitrary while a real client's own sin_zero (used
+// for blocks describing THAT client) is not. This specific 8-byte value
+// is just the first one this codebase happened to observe in a real
+// capture (2026-08-15) - no more "correct" than any other, since
+// nothing else is expected to independently know or check it.
+var ourOwnSinZero = [8]byte{0x18, 0xa0, 0x4e, 0x06, 0x20, 0xa0, 0x4e, 0x06}
+
+// synthesizedSockaddr builds one 16-byte sockaddr_in block for ip:port,
+// for use in the synthesized-reply functions below.
+//
+// sinZero (bytes 8-15): **not a fixed or per-role constant** - corrected
+// 2026-08-18 after a Direct-Connect-only capture
+// (archiving/sessions/20260818-*-directconnect-only-capture/NOTES.md)
+// caught self-block and peer-block sin_zero genuinely differing within
+// one real host's own 0x00 message, and proved the peer-block value was
+// an EXACT 8-byte echo of what the client itself had reported as its
+// own sin_zero in its earlier 0x20 ping - not something the host
+// invents. Two earlier reference captures (2026-08-15, 2026-08-17)
+// showed self-block and peer-block sin_zero as identical within one
+// message and were misread as "a fixed pattern" - in hindsight, that
+// was because host and joiner's own independently-generated tags
+// happened to coincide in both of those specific sessions, not because
+// the field doesn't vary. Callers describing THIS proxy's own address
+// should pass ourOwnSinZero (arbitrary and safe - nobody else has
+// independently generated our tag to check it against). Callers
+// describing a REAL CLIENT's address must pass that client's own
+// self-reported sin_zero, learned from its 0x20 ping (see
+// onDiscoveryPingNoHost/beginSimulatedHostOpen) - substituting anything
+// else is a confirmed-wrong value a real client's own validation can
+// trivially catch.
+func synthesizedSockaddr(ip [4]byte, port uint16, sinZero [8]byte) []byte {
+	sockaddr := make([]byte, sockaddrLen)
+	binary.LittleEndian.PutUint16(sockaddr[0:2], 2) // sin_family = AF_INET
+	binary.BigEndian.PutUint16(sockaddr[2:4], port)
+	copy(sockaddr[4:8], ip[:])
+	copy(sockaddr[8:16], sinZero[:])
+	return sockaddr
+}
+
+// synthesizeEmptyPoolDiscoveryReply builds a fake 0x26 discovery reply
+// from scratch - sent whenever forwardToBackend finds no eligible host
+// (empty pool, or every host full), so a client always sees a joinable-
+// looking game rather than silence. Byte layout matches
+// discoveryAddressOffsets' 0x26 entry and
+// docs/directplay8-protocol.md's own confirmed format: 5-byte header,
+// two duplicate 16-byte sockaddr_in blocks (both pointing at this
+// proxy's own public address, same as a real rewritten reply would),
+// then a 4-byte little-endian byte-length prefix and the UTF-16LE game
+// name + null terminator.
+func synthesizeEmptyPoolDiscoveryReply(cfg config) []byte {
+	nameUTF16 := utf16.Encode([]rune(simulatedFullLobbyGameName))
+	var nameBytes []byte
+	for _, u := range nameUTF16 {
+		nameBytes = binary.LittleEndian.AppendUint16(nameBytes, u)
+	}
+	nameBytes = binary.LittleEndian.AppendUint16(nameBytes, 0) // null terminator
+
+	sockaddr := synthesizedSockaddr(cfg.publicIP, cfg.publicPort, ourOwnSinZero)
+	out := []byte{0x26, 0x01, 0x00, 0x00, 0x00}
+	out = append(out, sockaddr...)
+	out = append(out, sockaddr...)
+	out = binary.LittleEndian.AppendUint32(out, uint32(len(nameBytes)))
+	out = append(out, nameBytes...)
+	return out
+}
+
+// synthesizeEmptyPoolPingReply builds a fake 0x21 liveness-ping reply -
+// see docs/directplay8-protocol.md's "Type 0x20 / 0x21" section: client
+// and host exchange this, once per LAN-browse refresh cycle, *separately*
+// from the 0x25/0x26 enumerate exchange - same double-sockaddr shape as
+// 0x26 but no trailing name string, 41 bytes total (5-byte header + two
+// 16-byte sockaddr_in blocks + 4 trailing zero bytes).
+//
+// This is the piece the first SIMULATE_FULL_LOBBY attempt was missing
+// (2026-08-15): the code originally answered *every* query type - both
+// the client's 0x25 enumerate query and its separate 0x20 ping query -
+// with the same synthesized 0x26 shape regardless, since nothing
+// inspected the incoming payload's own type byte. A real client sending
+// a 0x20 and getting a 0x26-shaped reply back is receiving something
+// its ping-handling logic has no reason to expect - a real host never
+// does this. Plausible explanation for why the game never showed as
+// joinable despite the 0x26 reply itself being byte-correct.
+func synthesizeEmptyPoolPingReply(cfg config) []byte {
+	sockaddr := synthesizedSockaddr(cfg.publicIP, cfg.publicPort, ourOwnSinZero)
+	out := []byte{0x21, 0x01, 0x00, 0x00, 0x00}
+	out = append(out, sockaddr...)
+	out = append(out, sockaddr...)
+	out = append(out, 0x00, 0x00, 0x00, 0x00)
+	return out
+}
+
+// synthesizedSessionUnclearConstant is the 4 bytes that sit between a
+// 0x00 self/peer-open message's connID and its first sockaddr_in block
+// (offset 4-7) - identical across every real capture this project has
+// taken, still not decoded further than "always this value" (see
+// sessionSelfOffset's own doc comment). Reproduced exactly rather than
+// guessed at, same posture as every other still-unclear field.
+var synthesizedSessionUnclearConstant = []byte{0xd8, 0xf6, 0x32, 0x00}
+
+// synthesizeSelfPeerOpen builds a fake 0x00 self/peer-open message - the
+// same message type sessionSelfOffset/sessionPeerOffset/rewriteSessionField
+// already handle everywhere else in this file (see sessionHandshakeLen's
+// own doc comment), just built from scratch here instead of rewriting a
+// real backend's message. connID is aom-lobby's own invented identity
+// (fakeHostConnID) - see synthesizeLobbyFullRejection's doc comment for
+// why this is invented rather than learned. selfIP/selfPort is this
+// proxy's own public address (what it's claiming as "the host");
+// peerIP/peerPort is the real client's own address, echoed back exactly
+// like a genuine host would. peerSinZero MUST be the client's own
+// self-reported sin_zero (learned from its 0x20 ping - see
+// onDiscoveryPingNoHost/beginSimulatedHostOpen), not an invented value -
+// see synthesizedSockaddr's own doc comment for why this matters.
+func synthesizeSelfPeerOpen(connID [2]byte, selfIP [4]byte, selfPort uint16, peerIP [4]byte, peerPort uint16, peerSinZero [8]byte) []byte {
+	out := []byte{0x00, 0x00}
+	out = append(out, connID[:]...)
+	out = append(out, synthesizedSessionUnclearConstant...)
+	out = append(out, synthesizedSockaddr(selfIP, selfPort, ourOwnSinZero)...)
+	out = append(out, synthesizedSockaddr(peerIP, peerPort, peerSinZero)...)
+	return out
+}
+
+// synthesizedHandshakeAckHostTrailer is the 34 bytes that follow the two
+// connID fields in every real host-sent 0x02 handshake-ack this project
+// has captured - see synthesizeHandshakeAck's own doc comment for why
+// the overall structure is real, not leaked memory. Two byte positions
+// are NOT safe to treat as fixed, now confirmed across four independent
+// real captures (2026-08-15's lobby-full-rejection, 2026-08-17's
+// session-establishment-investigation, and 2026-08-18's real-host-
+// joiner-namecheck, which alone contributed two more samples - a real
+// aom-headless host and a real joiner in the same live session):
+//
+//   - Byte offsets 10 and 22 (always equal to each other within one
+//     packet): the JOINER's value was 0xa4 in all four samples - solid
+//     enough to treat as role-constant. The HOST's value was 0xa6 once
+//     and 0xa8 twice - NOT a stable per-role constant, likely a per-
+//     process resource handle's low byte. Left at 0xa6 (this codebase's
+//     first-confirmed host value) since no value is more "correct" than
+//     any other and the receiving side doesn't appear to validate it.
+//   - Byte offsets 12 and 24 (also equal to each other within one
+//     packet, but shared between BOTH roles' acks in the SAME session):
+//     0x01 in the 2026-08-15 session, 0x02 in 2026-08-17, 0x01 again in
+//     2026-08-18 - genuinely live, session-specific data, not a
+//     constant. **Explained 2026-08-18** by cross-checking the official
+//     `[MC-DPL8R]` spec (`docs/directplay8-reference/`): every
+//     connection-establishment CFRAME it documents (CONNECT, CONNECTED,
+//     CONNECTED_SIGNED, HARD_DISCONNECT, SACK) carries a `tTimestamp`
+//     field defined as "the sender's computer system tick count, in
+//     millisecond units" - exactly the live-clock-reading shape these
+//     bytes exhibit (varies session to session, matches between two
+//     independent processes - host and joiner - reading within ~90ms of
+//     each other, consistent with both being on the same underlying
+//     kernel clock). Classic DirectPlay almost certainly carries its own
+//     version of this same concept, different wire format, same idea.
+//     These two positions are now computed live at send time (see
+//     livenessTickByte, synthesizeHandshakeAck) instead of hardcoded -
+//     left as 0x00 placeholders here since synthesizeHandshakeAck
+//     overwrites them unconditionally on every call.
+//     (Byte offsets 10/22 are a SEPARATE field, still hardcoded - ruled
+//     out as tick-count-shaped since the joiner's value never varied
+//     across any sample while byte 12/24 did; more likely a per-process
+//     resource handle, see above.)
+var synthesizedHandshakeAckHostTrailer = []byte{
+	0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe9, 0xe9, 0x7f, 0xa6,
+	0x00, 0x00, 0x00, 0x18, 0xf7, 0x32, 0x00, 0x3f, 0xe4, 0xd4, 0x7f,
+	0xa6, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x18, 0xf7, 0x32, 0x00,
+}
+
+// processStartTime is set once at package init - the reference point
+// livenessTickByte measures elapsed time from, standing in for "when
+// this sender's system started" (real DirectPlay measures from actual
+// system boot; this codebase only has its own process's own start
+// available, close enough for the purpose - see livenessTickByte).
+var processStartTime = time.Now()
+
+// livenessTickByte is our best-effort analog of DirectPlay's own
+// tTimestamp field (see synthesizedHandshakeAckHostTrailer's doc
+// comment) - a coarse, single-byte slice of milliseconds elapsed since
+// this aom-lobby process itself started, standing in for "the sender's
+// computer system tick count" the official spec describes. The exact
+// scale/formula real classic DirectPlay uses for its own equivalent
+// field is unconfirmed (only 3 real samples exist, all small values -
+// not enough to fit a precise formula), so this is an honest best
+// effort at "live and plausible" rather than a confirmed-correct
+// reproduction - the known-wrong alternative was a frozen constant that
+// never changes across any session, which is strictly worse regardless
+// of whether this exact scale is right.
+func livenessTickByte() byte {
+	return byte(time.Since(processStartTime).Milliseconds() % 256)
+}
+
+// synthesizeHandshakeAck builds a fake 0x02 handshake-ack message - see
+// docs/directplay8-packet-classification.md's confirmed-shapes table
+// ("0x02, 40 bytes... echoes sender IDs, no address"). ownConnID is
+// aom-lobby's own invented identity; peerConnID is the real client's own
+// connID, learned from its own 0x00 message (see the "session" case in
+// forwardToBackend's "no eligible host" branch).
+//
+// Correction (2026-08-17): the 34 trailing bytes were originally zeroed
+// here on the theory that they're leaked Wine process memory - wrong,
+// the overall structure is real and mostly fixed. NOT fully role-
+// constant though - see synthesizedHandshakeAckHostTrailer's own doc
+// comment (corrected 2026-08-18 after a third and fourth independent
+// capture, then explained via the official DirectPlay 8 spec's
+// tTimestamp field the same day) for exactly which byte positions are
+// safe to hardcode and which are genuinely live, session-specific data.
+// Byte offsets 18 and 30 of the full packet below (trailer offsets
+// 12/24) are computed live via livenessTickByte instead of hardcoded,
+// as of this correction. Whether this fix unblocks the still-open
+// "client never sends its own 0x02" mystery (this no-eligible-host
+// synthesis path specifically - the real backend-routing path was
+// separately confirmed working end-to-end 2026-08-18, see
+// lobby/packet-handling-design.md) is not yet confirmed either way.
+func synthesizeHandshakeAck(ownConnID, peerConnID [2]byte) []byte {
+	out := []byte{0x02, 0x00}
+	out = append(out, ownConnID[:]...)
+	out = append(out, peerConnID[:]...)
+	out = append(out, synthesizedHandshakeAckHostTrailer...)
+	tick := livenessTickByte()
+	out[18] = tick
+	out[30] = tick
+	return out
+}
+
+// synthesizeHeartbeat builds a fake "07ff" heartbeat/ack - see
+// docs/directplay8-packet-classification.md's confirmed-shapes table
+// ("07ff, 10 bytes... Heartbeat/ack for the settings-sync layer").
+// connID is aom-lobby's own invented identity.
+func synthesizeHeartbeat(connID [2]byte) []byte {
+	out := []byte{0x07, 0xff, 0x00, 0x00}
+	out = append(out, connID[:]...)
+	out = append(out, 0x00, 0x00, 0x00, 0x00)
+	return out
+}
+
+// simulatedFullLobbyCrackSignature is the string sent in the session-port
+// name-broadcast synthesizeNameBroadcast builds. Despite this message
+// type's name, it does NOT carry a real player nickname - every real
+// capture this project has ever taken (accepted and rejected sessions
+// alike, both roles) sends this exact same ASCII string, byte-for-byte,
+// regardless of either player's actual configured name. Leading theory:
+// a vestigial CD-key-check field - aomxnocd1.exe is a No-CD crack, and
+// this is plausibly a fixed salt/placeholder value the crack sends in
+// place of whatever a real, uncracked client would derive from an
+// actual CD key (see lobby/packet-handling-design.md's Phase 2 section
+// and the paullovesjade-not-a-name memory note for the full history).
+// Not confirmed as literally CD-key-related, but confirmed NOT a
+// nickname, and confirmed load-bearing - see below.
+//
+// Corrected 2026-08-19 - previously hardcoded to "TheIP" (a leftover
+// from before this field's true nature was understood, when it was
+// still assumed to be a real nickname slot). "TheIP" never appeared in
+// any real capture this project has ever taken; every single one sends
+// "paullovesjade" instead. This turned out to be THE fix for the
+// long-standing "client never sends its own name-broadcast" mystery -
+// live-tested: a real client would receive "TheIP" here and simply
+// never reply with its own name-broadcast, silently stalling until its
+// own ~2-minute patience timeout, regardless of every other byte/timing
+// fix made earlier. Switching to "paullovesjade" (matching every real
+// capture) fixed it immediately. This field's exact content is
+// functionally required, not cosmetic - do not change this value
+// without new capture evidence.
+const simulatedFullLobbyCrackSignature = "paullovesjade"
+
+// synthesizeNameBroadcast builds a fake 03-wrapped player-name broadcast
+// - see docs/directplay8-packet-classification.md's confirmed-shapes
+// table ("sub-type player-announce... Self-announce: GUID + nickname")
+// and the real capture decoded in lobby/packet-handling-design.md's
+// "Case 3 in detail" section. Encoding note, confirmed against that
+// capture: this name string is plain ASCII/UTF-8 (one byte per
+// character), NOT UTF-16LE like the discovery-port 0x26 reply's game
+// name - a genuinely different encoding between the two message
+// families, easy to get wrong by assuming consistency that isn't there.
+// connID is aom-lobby's own invented identity; seq is this message's
+// position in the fake exchange (0, then 1 for the observed retry/second
+// copy - see the real capture's own sequence).
+func synthesizeNameBroadcast(connID [2]byte, seq uint16, name string) []byte {
+	nameBytes := append([]byte(name), 0x00) // ASCII/UTF-8 + null terminator
+	out := []byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00}
+	binary.LittleEndian.PutUint16(out[2:4], seq)
+	copy(out[4:6], connID[:])
+	out = binary.LittleEndian.AppendUint16(out, uint16(len(nameBytes)))
+	out = append(out, nameBytes...)
+	out = append(out, 0x00, 0x00) // trailer, matches the real capture
+	return out
+}
+
 // discoveryQuery is the exact 9-byte 0x25 "enumerate hosts" packet AoM's
 // own client broadcasts while its LAN browse screen is open (see
 // docs/directplay8-protocol.md) - constant across every capture, no
@@ -512,12 +897,31 @@ var discoveryQuery = []byte{0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
 
 // hostProbe periodically asks a single backend "are you open?" the same
 // way a real client's LAN browse screen would, and remembers the answer.
-// One backend today (the static aom-headless-game address), matching the
-// rest of this pass - see CLAUDE.md's Architecture intention for the
-// eventual per-match multi-backend design, at which point this becomes a
-// slice of probes summed together rather than a single bool.
+// One hostProbe per pool member (see hostCandidate/hostPool) - each
+// backend's own dynamically-discovered pod IP now, not a shared Service
+// address (see CLAUDE.md's Architecture intention).
+//
+// History: briefly (2026-08-14) also actively probed the session port
+// (2300) directly - a synthetic empty datagram, checking for a hard
+// ECONNREFUSED vs. a timeout - after a live incident (pod "kwlj7") where
+// a host seemed to answer discovery fine while /proc/net/udp showed no
+// 2300 listener. That /proc/net/udp signal was already known-unreliable
+// by the time the probe was built (a *different* pod showed the
+// identical "missing" signature while demonstrably relaying real session
+// traffic for two live clients), and the probe meant to replace it with
+// something trustworthy turned out to have the same class of problem for
+// a different reason: confirmed live that AoM's DirectPlay8 session
+// socket isn't bound at the OS level until a real client's own handshake
+// starts arriving - it's genuinely not there yet while a freshly-hosted
+// lobby just sits open and waiting, which is indistinguishable from
+// "actually dead" to any probe sent before a real client approaches. No
+// synthetic pre-connect probe can fix that - it's a timing problem, not
+// a probe-format one. Removed rather than reworked; the only signal
+// that's ever actually reliable for a dead session port is what already
+// exists elsewhere: sessionProxy.forwardToBackend's own Dial/Write/Read
+// against genuine client traffic.
 type hostProbe struct {
-	backendAddr string
+	backendAddr string // discovery port (2299)
 
 	mu   sync.Mutex
 	open bool
@@ -577,6 +981,367 @@ func (h *hostProbe) hasWaitingGame() bool {
 	return h.open
 }
 
+// hostCandidate is one N-host pool member's full identity - every address
+// a real aom-headless backend needs (discovery probing, session routing,
+// driving its own input-agent instance) plus its own independent
+// liveness probe and match state. See
+// lobby/packet-handling-design.md's "N-host round-robin matchmaking"
+// section for the design this implements.
+//
+// This is phase 1 of that design - per-host *scoping* - not phase 2
+// (the real selectForNewClient priority policy). Everything that used to
+// assume "there is exactly one host" (session attribution, matchState,
+// clientTracker's consumers, triggerMatchStart) now threads a
+// *hostCandidate through instead, so a second host can't silently
+// cross-wire with the first - see hostPool.assignForClient's doc comment
+// for why assignment itself is still a placeholder.
+type hostCandidate struct {
+	// id is just for logging - "host-0", "host-1", ... in pool order.
+	id                    string
+	discoveryBackendAddr  string
+	sessionBackendAddr    string
+	sessionBackendUDPAddr *net.UDPAddr
+	inputAgentAddr        string
+
+	probe *hostProbe
+	// match is this host's own matchState (ready-toggle tracking, pair
+	// relay) - previously a single global instance shared by every
+	// client regardless of which backend they were actually talking to.
+	// Set once during pool construction in main(), same pattern as
+	// today's single match.closeSession wiring.
+	match *matchState
+}
+
+// hostPool tracks every known aom-headless backend. Replaces the old
+// single cfg.discoveryBackendAddr/cfg.sessionBackendAddr/
+// cfg.inputAgentAddr.
+//
+// N-host phase 2 update (2026-08-13): hosts is no longer built once at
+// startup from static config - see podLister below. It's now mutated
+// live by podLister.run's reconciliation loop as pods are created/
+// deleted/scaled, which is also why every method here that touches hosts
+// now holds mu (addHost/removeHost/hostForBackendIP) - previously safe
+// to read hosts lock-free since it never changed after construction, not
+// true anymore.
+type hostPool struct {
+	mu    sync.Mutex
+	hosts []*hostCandidate
+
+	// nextWaitingRR/nextEmptyRR are round-robin cursors for
+	// selectLocked's two eligible tiers, kept independent so a long run
+	// of "waiting" picks can't starve the round-robin position for
+	// "empty" hosts once that tier is needed, or vice versa - exactly
+	// the concern packet-handling-design.md's hostPool sketch flagged
+	// before this was built.
+	nextWaitingRR int
+	nextEmptyRR   int
+	// nextPeekRR is peekHost's own separate cursor - kept independent of
+	// the two above so non-committing discovery-time peeks don't perturb
+	// selectLocked's own round-robin fairness for real, sticky
+	// assignments.
+	nextPeekRR int
+	// sessionCountForHost is sessionProxy's own per-host session
+	// counter (sessionProxy.sessionCountForHost), wired up in main()
+	// once sessionProxy exists - same chicken-and-egg reason
+	// podLister.closeSession is wired up after the fact. selectLocked
+	// needs this to tell "empty" from "waiting for a second player"
+	// apart: hostProbe.hasWaitingGame() alone can't (it's true for both
+	// - a host keeps answering discovery queries whether 0 or 1 real
+	// clients are connected, see docs/lobby-status-api.md's "How it
+	// decides open" section), but the real session count sessionProxy
+	// already tracks per host can.
+	sessionCountForHost func(*hostCandidate) int
+	// assigned makes host selection sticky per real client IP for the
+	// life of that client's connection (and any later reconnect/rejoin -
+	// matches this project's already-confirmed same-client-rejoin
+	// behavior, which depends on landing on the same host again). Without
+	// this, a client's discovery-port query and session-port traffic
+	// could each independently round-robin to a *different* host - see
+	// packet-handling-design.md's "session-port stickiness" section,
+	// pulled forward into this phase since matchmaking is unsafe without
+	// it, not a later nice-to-have. Keyed by IP only (not full addr):
+	// discovery-port and session-port traffic use different local client
+	// ports for the same real player (see clientTracker's own doc
+	// comment on the same distinction).
+	//
+	// Known limitation, unchanged by the move to dynamic discovery: if a
+	// client's assigned host is later removed from the pool (its pod
+	// died/rescheduled mid-match - see removeHost), this map still points
+	// at the now-gone hostCandidate, and that client's traffic will keep
+	// trying to reach a dead pod until its session naturally idles out
+	// (reapIdleSessions) rather than being re-matched. Graceful handling
+	// of a host disappearing mid-match is deliberately not solved in this
+	// pass - same "flag the gap, don't silently assume it away" practice
+	// this file already applies elsewhere (see onClientGone's own
+	// not-wired-up status).
+	//
+	// Also still leaks one entry per distinct client IP ever seen for the
+	// life of the process - acceptable for this project's dev/test scope
+	// (CLAUDE.md's Goals), revisit if this ever runs long-lived against
+	// real traffic.
+	assigned map[string]*hostCandidate
+}
+
+// assignForClient returns clientIP's assigned host, picking one via
+// selectLocked on first contact and remembering it thereafter - see this
+// type's own doc comment for why sticky assignment isn't optional here.
+// Returns (nil, false) if no host is currently eligible - the pool is
+// empty (brief window at startup before podLister's first successful
+// poll lands, or every known host has been removed - see removeHost), or
+// every host is full (packet-handling-design.md's case 3). Callers must
+// handle this rather than assume a host always exists, unlike the old
+// static-config version where an empty pool was a startup-time fatal
+// error, not a runtime possibility. Case 3 is a plain drop today, not a
+// spoofed "lobby full" rejection - see synthesizeLobbyFullRejection's own
+// doc comment on why that's still blocked on a reference capture that
+// hasn't been taken.
+func (p *hostPool) assignForClient(clientIP string) (*hostCandidate, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if h, ok := p.assigned[clientIP]; ok {
+		return h, true
+	}
+	h, ok := p.selectLocked()
+	if !ok {
+		return nil, false
+	}
+	if p.assigned == nil {
+		p.assigned = make(map[string]*hostCandidate)
+	}
+	p.assigned[clientIP] = h
+	return h, true
+}
+
+// maxRealClientsPerHost is this project's fixed 1v1 scope (CLAUDE.md's
+// Goals: "host + exactly two real playing clients") - see hostFull's doc
+// comment for why this hard cap matters independently of
+// matchState.full().
+const maxRealClientsPerHost = 2
+
+// hostFull reports whether h has no room for another real client -
+// either its pairRelay has already formed (matchState.full(), the
+// authoritative "these two are matched" signal used everywhere else in
+// this file), OR it already has maxRealClientsPerHost real sessions
+// registered, whichever comes first.
+//
+// Correction (2026-08-14): originally checked matchState.full() alone.
+// Found live, with 2 hosts and 3 real clients: matchState.full() only
+// goes true once the *host's own broadcast exchange* between the two
+// paired clients actually completes - which can lag behind (or, per this
+// project's still-unresolved local-topology broadcast-bypass anomaly,
+// never complete at all - see existingPeerBroadcast's own doc comment)
+// the moment a host genuinely has no room left. A third real client's
+// selectLocked call landed on an already-2-real-client host because
+// full() hadn't caught up yet, with nowhere for it to actually go (AoM's
+// own lobby only ever has 2 open slots per this project's scope) - stuck
+// "Attempting to Connect" by construction, not a network issue. Session
+// count is the more immediate, reliable signal; checking both closes the
+// gap regardless of which one lags.
+func (p *hostPool) hostFull(h *hostCandidate) bool {
+	if h.match.full() {
+		return true
+	}
+	return p.sessionCountForHost != nil && p.sessionCountForHost(h) >= maxRealClientsPerHost
+}
+
+// hostLive reports whether h is actually usable right now - its discovery
+// port answering (hostProbe.hasWaitingGame()) - added alongside hostFull
+// so a pod that's in the pool but not actually up (crashed, hung, or just
+// hasn't self-hosted yet) can't eat a brand-new client's ~15s connect
+// budget on a host that was never going to work. Note this is a liveness
+// check only, not a capacity one - see hostFull/sessionCountForHost for
+// why it alone can't distinguish "empty" from "waiting for a second
+// player" the way capacity selection needs.
+//
+// History: briefly (2026-08-14) also required a separate session-port
+// (2300) probe here, after the kwlj7 incident (see hostProbe's own doc
+// comment for the full history). Deliberately not brought back: the
+// session-port probe's own failure mode was worse than what it replaced
+// - it read a genuinely healthy, freshly-hosted lobby as dead, because
+// DirectPlay8 doesn't bind that socket until a real client's handshake
+// arrives, which no pre-connect probe can distinguish from "actually
+// dead." A dead session port is caught for real where it always was:
+// sessionProxy.forwardToBackend's own Dial/Write/Read against genuine
+// client traffic.
+//
+// Narrow, self-healing false-negative: a host added to the pool within
+// the last podPollInterval might not have its first probe result in yet
+// (hostProbe.run() ticks every probeInterval, 3s) and would look
+// not-live for that brief window even though it's actually fine - not
+// worth a separate fix, it clears on its own within one probe cycle.
+func (p *hostPool) hostLive(h *hostCandidate) bool {
+	return h.probe != nil && h.probe.hasWaitingGame()
+}
+
+// selectLocked implements packet-handling-design.md's "Selection policy"
+// priority order for a newly-arriving client: prefer a host already
+// waiting for a second player (round-robin among those specifically, if
+// more than one), otherwise an empty host (round-robin among those),
+// otherwise ineligible. Must be called with p.mu held - only ever called
+// from assignForClient, which already holds it.
+//
+// A host is excluded entirely if it's full (hostFull) or not currently
+// live (hostLive). Below that, sessionCountForHost distinguishes 0 real
+// sessions (empty) from 1 (waiting) - see this type's own doc comment on
+// why hostProbe's liveness check alone can't make that distinction.
+//
+// On the race packet-handling-design.md's "The race this needs to guard
+// against" section flags (two clients connecting within the same few
+// seconds both landing on the same host before either session is
+// registered): this is actually already closed, not just unaddressed.
+// assignForClient (the only caller of this method) is only ever reached
+// via sessionProxy.forwardToBackend, which in turn is only ever called
+// from sessionProxy.run()'s single sequential ReadFromUDP loop - there is
+// no other call site. Go processes that loop one packet at a time, and
+// forwardToBackend doesn't return until the new session is fully
+// inserted into p.sessions, so two different clients' assignment
+// decisions can never actually interleave - by the time a second
+// client's packet is even read, the first client's session already
+// exists and sessionCountForHost already reflects it. This invariant
+// depends on assignForClient never being called from anywhere else
+// (e.g. a future second goroutine) - worth remembering if that ever
+// changes, since it's what makes a claim/reservation mechanism
+// unnecessary today rather than merely un-implemented.
+func (p *hostPool) selectLocked() (*hostCandidate, bool) {
+	var waiting, empty []*hostCandidate
+	for _, h := range p.hosts {
+		if p.hostFull(h) || !p.hostLive(h) {
+			continue
+		}
+		n := 0
+		if p.sessionCountForHost != nil {
+			n = p.sessionCountForHost(h)
+		}
+		if n == 0 {
+			empty = append(empty, h)
+		} else {
+			waiting = append(waiting, h)
+		}
+	}
+
+	if len(waiting) > 0 {
+		h := waiting[p.nextWaitingRR%len(waiting)]
+		p.nextWaitingRR++
+		return h, true
+	}
+	if len(empty) > 0 {
+		h := empty[p.nextEmptyRR%len(empty)]
+		p.nextEmptyRR++
+		return h, true
+	}
+	return nil, false
+}
+
+// peekHost returns any currently-eligible (not full) host, round-robin
+// via its own independent cursor - deliberately NOT sticky and NOT
+// tier-aware like selectLocked/assignForClient. Used by discoveryProxy
+// to pick a backend to relay a 0x25/0x26 discovery exchange through
+// without committing the client to it - see this session's "Defer host
+// assignment from discovery-time to session-connect-time" change.
+// Discovery/enumeration traffic doesn't represent real intent to connect
+// (a client's LAN/Direct-IP screen fires 0x25 queries just from being
+// open - see docs/directplay8-protocol.md and the official [MC-DPL8CS]
+// spec, both confirming Direct-Connect reuses the exact same enumeration
+// exchange as passive LAN browsing), so matchmaking's real,
+// sticky, tiered decision belongs on the session-port handshake that
+// follows, not here - see assignForClient.
+//
+// Still relays through a genuine backend rather than synthesizing a
+// reply from nothing: the reply's meaningful fields get rewritten to
+// this proxy's own address regardless of which backend answered (see
+// discoveryRewrite), but the message also carries several bytes of
+// still-unexplained data (docs/directplay8-protocol.md's "sin_zero"
+// notes) that this project has never fabricated - every rewrite path
+// elsewhere only overwrites known fields on top of a genuine relayed
+// reply, and this keeps that same posture.
+func (p *hostPool) peekHost() (*hostCandidate, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	var eligible []*hostCandidate
+	for _, h := range p.hosts {
+		if !p.hostFull(h) && p.hostLive(h) {
+			eligible = append(eligible, h)
+		}
+	}
+	if len(eligible) == 0 {
+		return nil, false
+	}
+	h := eligible[p.nextPeekRR%len(eligible)]
+	p.nextPeekRR++
+	return h, true
+}
+
+// hostForBackendIP returns whichever pool member's session-port backend
+// address matches ip, if any - used by run() to recognize a host's own
+// unprompted traffic (see relayBackendInitiated) and know which host's
+// sessions to scope the relay search to, now that there's more than one
+// to confuse it with.
+func (p *hostPool) hostForBackendIP(ip net.IP) (*hostCandidate, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, h := range p.hosts {
+		if h.sessionBackendUDPAddr != nil && h.sessionBackendUDPAddr.IP.Equal(ip) {
+			return h, true
+		}
+	}
+	return nil, false
+}
+
+// addHost appends a newly-discovered pod to the pool, starting its own
+// liveness probe and match state - the runtime equivalent of what main()
+// used to do once, up front, for every statically-configured host. Safe
+// to call for a host that's already present (by id) - a no-op, since
+// podLister's reconciliation loop only ever calls this for pods it
+// hasn't already added.
+func (p *hostPool) addHost(h *hostCandidate) {
+	p.mu.Lock()
+	p.hosts = append(p.hosts, h)
+	p.mu.Unlock()
+	log.Printf("[pool] host added: %s (discovery %s, session %s, input-agent %s)",
+		h.id, h.discoveryBackendAddr, h.sessionBackendAddr, h.inputAgentAddr)
+}
+
+// removeHost drops a pod that's no longer listed (deleted/rescheduled/
+// scaled down) from the pool. Does NOT touch any client's sticky
+// assignment (see assigned's own doc comment on the known gap that
+// leaves) or tear down the removed host's pairRelay/matchState - existing
+// sessions referencing it simply become orphaned and eventually idle out
+// via reapIdleSessions, same as any other silently-gone backend.
+func (p *hostPool) removeHost(id string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for i, h := range p.hosts {
+		if h.id == id {
+			p.hosts = append(p.hosts[:i], p.hosts[i+1:]...)
+			log.Printf("[pool] host removed: %s (no longer listed)", id)
+			return
+		}
+	}
+}
+
+// hostIDs returns the id of every host currently in the pool - used by
+// podLister's reconciliation loop to diff against the latest pod list
+// without holding the lock for the whole reconciliation.
+func (p *hostPool) hostIDs() map[string]bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	ids := make(map[string]bool, len(p.hosts))
+	for _, h := range p.hosts {
+		ids[h.id] = true
+	}
+	return ids
+}
+
+// snapshot returns a copy of the current host list, safe to range over
+// without holding the pool's lock - used by main()'s per-tick status
+// endpoints and anywhere else that needs to look at "every host right
+// now" rather than a single lookup.
+func (p *hostPool) snapshot() []*hostCandidate {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]*hostCandidate(nil), p.hosts...)
+}
+
 // clientTracker remembers the most recently seen real client address,
 // shared between the discovery and session proxies. It exists because the
 // backend pod, once it learns a client's real address (from the
@@ -616,17 +1381,9 @@ func (t *clientTracker) get() *net.UDPAddr {
 }
 
 type config struct {
-	discoveryListenAddr  string
-	discoveryBackendAddr string
-	sessionListenAddr    string
-	sessionBackendAddr   string
-	statusListenAddr     string
-	// inputAgentAddr is input-agent's address (see input-agent/main.go) -
-	// unlike sessionBackendAddr, safe to point at the aom-headless-game
-	// Service's stable DNS name rather than the pod's raw IP, since these
-	// are plain client-initiated HTTP calls with no source-address
-	// matching requirement (see triggerMatchStart).
-	inputAgentAddr string
+	discoveryListenAddr string
+	sessionListenAddr   string
+	statusListenAddr    string
 	// verbose gates the hex-dump/per-packet debug logging below - it's
 	// synchronous, allocates a hex string per packet, and runs on every
 	// single packet including the high-frequency session-port ones, which
@@ -654,11 +1411,8 @@ func loadConfig() config {
 
 	var cfg config
 	cfg.discoveryListenAddr = getenv("LISTEN_ADDR", ":2299")
-	cfg.discoveryBackendAddr = getenv("AOM_BACKEND_ADDR", "127.0.0.1:2299")
 	cfg.sessionListenAddr = getenv("SESSION_LISTEN_ADDR", ":2300")
-	cfg.sessionBackendAddr = getenv("SESSION_BACKEND_ADDR", "127.0.0.1:2300")
 	cfg.statusListenAddr = getenv("STATUS_LISTEN_ADDR", ":8080")
-	cfg.inputAgentAddr = getenv("INPUT_AGENT_ADDR", "aom-headless-game:8082")
 	cfg.verbose = getenv("VERBOSE", "") != ""
 	copy(cfg.publicIP[:], ip)
 
@@ -675,6 +1429,223 @@ func loadConfig() config {
 	return cfg
 }
 
+const (
+	// serviceAccountDir is the standard mount every Kubernetes pod gets
+	// for its own ServiceAccount, no extra volume config needed beyond
+	// setting serviceAccountName (see k8s/lobby-deployment.yaml) and
+	// granting it a Role (see k8s/lobby-rbac.yaml).
+	serviceAccountDir = "/var/run/secrets/kubernetes.io/serviceaccount"
+
+	// AoM's own fixed DirectPlay8 ports (see CLAUDE.md's Goals) plus
+	// input-agent's - every aom-headless pod uses these three regardless
+	// of its own pod IP, so podLister only needs to discover the IP.
+	headlessDiscoveryPort  = 2299
+	headlessSessionPort    = 2300
+	headlessInputAgentPort = 8082
+
+	podPollInterval = 3 * time.Second // same cadence as hostProbe's own ticker
+)
+
+// podLister discovers aom-headless backend pods dynamically via the
+// Kubernetes API, replacing the old static comma-separated env-var
+// config entirely - see hostPool's own doc comment and
+// lobby/packet-handling-design.md's "N-host round-robin matchmaking"
+// section. `kubectl scale deployment/aom-headless --replicas=N` is now
+// the entire "add a host" operation - no manifest edits, no lobby
+// redeploy.
+//
+// Deliberately a hand-rolled REST poller against the in-cluster API
+// server rather than k8s.io/client-go: this project has had zero
+// external Go dependencies until now (lobby/go.mod), and this is well
+// under 100 lines of stdlib net/http - not worth a large transitive
+// dependency tree just to poll a list-pods endpoint every few seconds,
+// especially given hostProbe next door already establishes that exact
+// polling shape for a different purpose.
+//
+// Reads the same in-cluster ServiceAccount mount every pod gets for
+// free: bearer token + CA cert from serviceAccountDir, API server
+// host/port from the KUBERNETES_SERVICE_HOST/KUBERNETES_SERVICE_PORT env
+// vars Kubernetes always injects. Namespace and label selector come from
+// AOM_HEADLESS_NAMESPACE/AOM_HEADLESS_LABEL_SELECTOR instead of reading
+// the mounted namespace file - this repo has never used more than the
+// `default` namespace (confirmed by grep across every k8s/*.yaml), so an
+// env var with that default is simpler than parsing another file for a
+// value that's effectively constant here.
+type podLister struct {
+	apiServer     string // e.g. "https://10.96.0.1:443"
+	namespace     string
+	labelSelector string
+	token         string
+	httpClient    *http.Client
+	cfg           config
+
+	// closeSession is sessionProxy.closeSession, set once in main() after
+	// sessionProxy exists (chicken-and-egg, same reason match.closeSession
+	// used to be wired after the fact) - handed to every newly-discovered
+	// host's matchState, same as the old static path did for every host
+	// up front.
+	closeSession func(clientAddr *net.UDPAddr)
+}
+
+// newInClusterPodLister builds a podLister from the standard in-cluster
+// ServiceAccount mount. Fatal on any missing piece: aom-lobby cannot
+// discover any backend at all without this, so failing fast at startup
+// is more useful than silently limping along with a permanently-empty
+// pool - same posture loadConfig already takes for a malformed
+// PUBLIC_ADDR.
+func newInClusterPodLister(cfg config) *podLister {
+	namespace := getenv("AOM_HEADLESS_NAMESPACE", "default")
+	labelSelector := getenv("AOM_HEADLESS_LABEL_SELECTOR", "app=aom-headless")
+
+	host := getenv("KUBERNETES_SERVICE_HOST", "")
+	port := getenv("KUBERNETES_SERVICE_PORT", "")
+	if host == "" || port == "" {
+		log.Fatalf("KUBERNETES_SERVICE_HOST/KUBERNETES_SERVICE_PORT not set - aom-lobby must run as an in-cluster pod to discover aom-headless backends (see k8s/lobby-deployment.yaml)")
+	}
+	tokenBytes, err := os.ReadFile(serviceAccountDir + "/token")
+	if err != nil {
+		log.Fatalf("reading ServiceAccount token: %v (is k8s/lobby-rbac.yaml applied, and serviceAccountName set on the aom-lobby Deployment?)", err)
+	}
+	caBytes, err := os.ReadFile(serviceAccountDir + "/ca.crt")
+	if err != nil {
+		log.Fatalf("reading ServiceAccount CA cert: %v", err)
+	}
+	caPool := x509.NewCertPool()
+	if !caPool.AppendCertsFromPEM(caBytes) {
+		log.Fatalf("parsing ServiceAccount CA cert %s/ca.crt: no valid certificates found", serviceAccountDir)
+	}
+
+	return &podLister{
+		apiServer:     fmt.Sprintf("https://%s:%s", host, port),
+		namespace:     namespace,
+		labelSelector: labelSelector,
+		token:         strings.TrimSpace(string(tokenBytes)),
+		cfg:           cfg,
+		httpClient: &http.Client{
+			// Generous relative to an in-cluster API call (same node,
+			// same cluster network) while still bounded - mirrors
+			// probeTimeout's own reasoning for hostProbe's UDP probes.
+			Timeout: 3 * probeTimeout,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{RootCAs: caPool},
+			},
+		},
+	}
+}
+
+// podInfo is the subset of a Pod's API representation reconcileOnce
+// needs.
+type podInfo struct {
+	name string
+	ip   string
+}
+
+// list returns every Running pod matching the configured label selector
+// that has an assigned IP - pods still starting (no podIP yet) or
+// terminating (phase no longer Running) are excluded, the same "don't
+// route to something not actually ready" posture hostProbe already
+// applies via its own liveness check.
+func (pl *podLister) list() ([]podInfo, error) {
+	reqURL := fmt.Sprintf("%s/api/v1/namespaces/%s/pods?labelSelector=%s",
+		pl.apiServer, pl.namespace, url.QueryEscape(pl.labelSelector))
+	req, err := http.NewRequest(http.MethodGet, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+pl.token)
+	resp, err := pl.httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("unexpected status %s: %s", resp.Status, body)
+	}
+
+	var parsed struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Status struct {
+				Phase string `json:"phase"`
+				PodIP string `json:"podIP"`
+			} `json:"status"`
+		} `json:"items"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		return nil, err
+	}
+
+	var pods []podInfo
+	for _, item := range parsed.Items {
+		if item.Status.Phase != "Running" || item.Status.PodIP == "" {
+			continue
+		}
+		pods = append(pods, podInfo{name: item.Metadata.Name, ip: item.Status.PodIP})
+	}
+	return pods, nil
+}
+
+// run polls list on a ticker and reconciles pool against the result -
+// same ticker-poll shape as hostProbe.run() next door. Never returns;
+// call with `go`.
+func (pl *podLister) run(pool *hostPool) {
+	ticker := time.NewTicker(podPollInterval)
+	defer ticker.Stop()
+	for {
+		pl.reconcileOnce(pool)
+		<-ticker.C
+	}
+}
+
+// reconcileOnce lists pods once and diffs the result against pool: new
+// pods get a full hostCandidate built and added (own probe started, own
+// matchState created - the runtime equivalent of what main() used to do
+// once, up front, for every statically-configured host); pods no longer
+// listed get removed (see removeHost's own doc comment on what that
+// does and doesn't clean up).
+func (pl *podLister) reconcileOnce(pool *hostPool) {
+	pods, err := pl.list()
+	if err != nil {
+		log.Printf("[pool] listing pods (namespace=%s, selector=%s): %v", pl.namespace, pl.labelSelector, err)
+		return
+	}
+
+	seen := make(map[string]bool, len(pods))
+	known := pool.hostIDs()
+	for _, pod := range pods {
+		seen[pod.name] = true
+		if known[pod.name] {
+			continue
+		}
+		discoveryAddr := fmt.Sprintf("%s:%d", pod.ip, headlessDiscoveryPort)
+		sessionAddr := fmt.Sprintf("%s:%d", pod.ip, headlessSessionPort)
+		sessionUDPAddr, err := net.ResolveUDPAddr("udp", sessionAddr)
+		if err != nil {
+			log.Printf("[pool] resolving session address for new pod %s (%s): %v", pod.name, sessionAddr, err)
+			continue
+		}
+		h := &hostCandidate{
+			id:                    pod.name,
+			discoveryBackendAddr:  discoveryAddr,
+			sessionBackendAddr:    sessionAddr,
+			sessionBackendUDPAddr: sessionUDPAddr,
+			inputAgentAddr:        fmt.Sprintf("%s:%d", pod.ip, headlessInputAgentPort),
+			match:                 &matchState{cfg: pl.cfg, closeSession: pl.closeSession},
+			probe:                 &hostProbe{backendAddr: discoveryAddr},
+		}
+		pool.addHost(h)
+		go h.probe.run()
+	}
+	for id := range known {
+		if !seen[id] {
+			pool.removeHost(id)
+		}
+	}
+}
+
 func getenv(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -685,6 +1656,12 @@ func getenv(key, def string) string {
 type session struct {
 	backendConn *net.UDPConn
 	clientAddr  *net.UDPAddr // the real client this session relays for
+	// host is which pool member this session was assigned to (see
+	// hostPool.assignForClient) - added for N-host support. Every place
+	// that used to reach for a single closed-over backend address or the
+	// single global matchState now goes through this instead, so traffic
+	// and match state for two different real matches can never blend.
+	host *hostCandidate
 
 	mu       sync.Mutex
 	lastSeen time.Time
@@ -702,6 +1679,23 @@ type session struct {
 	// field above, same as lastSeen.
 	connID      [2]byte
 	connIDKnown bool
+
+	// selfSinZero/selfSinZeroKnown record this client's own self-reported
+	// sin_zero tag (see docs/directplay8-protocol.md's "sin_zero" resolution -
+	// a per-participant identity tag each side generates once, which whoever
+	// else embeds that participant's address must echo back exactly), learned
+	// from the sin_zero this client itself sent in its own genuine "self"
+	// sockaddr_in block (sessionSelfOffset+8) the first time its own 0x00
+	// open passes through rewriteToBackend - i.e. before this proxy rewrites
+	// that block's IP/port for the backend. Used by rewriteToClient's
+	// isNewPeerBroadcast/isExistingPeerBroadcast branches to overwrite a
+	// genuine broadcast's own embedded sin_zero with the described peer's
+	// real, learned value rather than trusting whatever the host embedded
+	// (which can be a stale/zeroed placeholder on the "empty variant" of
+	// these messages - see those branches' own doc comments). Guarded by
+	// the mu field above, same as connID.
+	selfSinZero      [8]byte
+	selfSinZeroKnown bool
 }
 
 // proxy is a generic per-client UDP session relay: one shared socket
@@ -711,10 +1705,26 @@ type session struct {
 // packet's payload just before it's forwarded in that direction; either
 // may be nil to pass packets through untouched.
 type proxy struct {
-	name        string // for logging, e.g. "discovery" or "session"
-	cfg         config
-	clientConn  *net.UDPConn
-	backendAddr string
+	name       string // for logging, e.g. "discovery" or "session"
+	cfg        config
+	clientConn *net.UDPConn
+
+	// pool replaces the old single backendAddr string - see hostPool.
+	// backendAddrForHost picks which of a hostCandidate's addresses this
+	// particular proxy cares about (discoveryBackendAddr for
+	// discoveryProxy, sessionBackendAddr for sessionProxy) - the two
+	// proxies share one pool but each dials a different address on it.
+	pool               *hostPool
+	backendAddrForHost func(h *hostCandidate) string
+	// selectHost picks which host a new client's first packet through
+	// this proxy gets dialed to - the two proxies plug in different
+	// behavior here (added when host assignment moved from
+	// discovery-time to session-connect-time): sessionProxy uses
+	// pool.assignForClient (sticky, tiered - this is the real
+	// matchmaking decision, see that method's doc comment on why it
+	// belongs here and not on discovery traffic). discoveryProxy uses
+	// pool.peekHost (non-committing - see that method's doc comment).
+	selectHost func(clientIP string) (*hostCandidate, bool)
 
 	rewriteToBackend func(payload []byte, cfg config, sess *session) []byte
 	rewriteToClient  func(payload []byte, cfg config, sess *session) []byte
@@ -723,30 +1733,149 @@ type proxy struct {
 	// address before normal forwarding - used to feed clientTracker.
 	onClientPacket func(clientAddr *net.UDPAddr)
 
-	// backendUDPAddr and tracker, if both set, let run() recognize
-	// unsolicited packets arriving from the backend itself (not from any
+	// detectBackendOrigin and tracker, if both set, let run() recognize
+	// unsolicited packets arriving from a backend itself (not from any
 	// client) on this proxy's listening socket, and relay them to the
 	// last-known real client instead of mistaking the backend for a new
-	// client - see relayBackendInitiated and the clientTracker doc comment.
-	backendUDPAddr *net.UDPAddr
-	tracker        *clientTracker
+	// client - see relayBackendInitiated and the clientTracker doc
+	// comment. Only sessionProxy sets this today, same as the old
+	// backendUDPAddr-set-or-not gate did - discoveryProxy has never
+	// needed it. Which specific host a given backend packet came from is
+	// resolved per-packet via pool.hostForBackendIP, not stored here,
+	// since (unlike the old single backendUDPAddr) there's more than one
+	// possible source now.
+	detectBackendOrigin bool
+	tracker             *clientTracker
+
+	// onDiscoveryPingNoHost, if set, is called by discoveryProxy whenever
+	// it answers a client's 0x20 liveness ping with a synthesized reply
+	// (no eligible host in the pool) - wired in main() to
+	// sessionProxy.beginSimulatedHostOpen. This is what lets the session
+	// proxy kick off its proactive host-initiated open before the client
+	// ever sends anything on port 2300 itself - see that method's own doc
+	// comment for why this exists. discoveryProxy has no direct reference
+	// to sessionProxy (see the var-then-literal wiring for the reverse
+	// direction just above sessionProxy's own construction in main()), so
+	// this indirection is the same pattern as podLister's callbacks below.
+	// clientSinZero is the client's own self-reported sin_zero, extracted
+	// from the same 0x20 ping - see synthesizedSockaddr's doc comment
+	// (corrected 2026-08-18) for why this must be threaded through rather
+	// than invented at the session-proxy side.
+	onDiscoveryPingNoHost func(clientIP net.IP, clientSinZero [8]byte)
 
 	// onSessionRemoved, if set, is called whenever a client's session is
 	// torn down, however that happens - backendToClient's own read-error
 	// cleanup or reapIdleSessions' idle-timeout cleanup both call it, so
 	// callers get one consistent "this client is gone" signal regardless
-	// of which path caught it.
+	// of which path caught it. Takes the full session (not just the
+	// address) so callers can reach sess.host - added 2026-08-14 when
+	// this got wired up for real, see main()'s sessionProxy construction.
 	//
-	// Correction (2026-08-12): NOT currently wired to anything on
-	// sessionProxy - see that struct literal's own correction comment in
-	// main() for why firing pair-relay teardown from a plain idle-timeout
-	// broke the second client's join outright. Left as a hook for once a
-	// real departure signal exists, not removed.
-	onSessionRemoved func(clientAddr *net.UDPAddr)
+	// History: NOT wired to anything on sessionProxy from 2026-08-12
+	// until now - firing pair-relay teardown from a plain host-channel
+	// idle-timeout broke the second client's join outright back then,
+	// because a client mid-handshake with its peer over the pair relay
+	// can look idle on the host channel alone while genuinely still
+	// present. Fixed at the source this time: reapIdleSessions itself
+	// now checks the pair relay's own per-client activity
+	// (pairRelay.idleFor) before ever reaping a session whose host is
+	// already paired, so by the time this hook fires, both channels have
+	// actually gone quiet - not just the one this file happened to be
+	// watching.
+	onSessionRemoved func(sess *session)
 
 	mu       sync.Mutex
 	sessions map[string]*session
+
+	// simulatedClients tracks per-client state for the synthesized
+	// handshake+rejection sequence sent whenever there's no eligible
+	// host - see forwardToBackend's "session" case. Guarded by its own
+	// mutex, deliberately separate from mu/sessions above since this
+	// tracks fake, no-real-backend clients rather than real ones -
+	// keeping it separate avoids any risk of this synthesis path
+	// interacting with real session bookkeeping. Reactive, not a fixed
+	// script - see simulatedClientState's own doc comment for why a
+	// fixed one-shot sequence (tried first, 2026-08-15) wasn't enough.
+	simulatedClientsMu sync.Mutex
+	simulatedClients   map[string]*simulatedClientState
 }
+
+// simulatedClientState is one client's progress through the synthesized
+// handshake sent whenever forwardToBackend finds no eligible host.
+//
+// Reactive, not a fixed timer-driven script: a first attempt
+// (2026-08-15) fired self/peer-open, ack, two name-broadcasts, and the
+// rejection on a fixed ~150ms timer regardless of what the client
+// itself sent - confirmed live NOT to work (client stayed in
+// "Attempting to Connect"). Closely re-reading the real reference
+// capture's own timing showed why: both sides retry and interleave
+// somewhat independently (six 0x00 retries over ~600ms, the joiner
+// sending its own 0x02 before the host's, the host re-sending an older
+// name-broadcast seq after already sending a newer one) - consistent
+// with an underlying reliable-transport retry/ack layer neither this
+// struct nor the rest of this file has full visibility into. This
+// version instead reacts to each of the client's own packets as they
+// arrive and replies in kind (its own 0x00 answered with the host's own
+// 0x00, every retry included; its own 0x02 answered with the host's;
+// its own name-broadcast answered with the host's, then the rejection)
+// - matching the real capture's own apparent shape of "the host
+// responds to what it's just been told, not on a fixed schedule."
+type simulatedClientState struct {
+	mu sync.Mutex
+	// clientConnID is learned from the client's own first 0x00 message
+	// (see synthesizeSelfPeerOpen's doc comment on why this is never
+	// guessed).
+	clientConnID     [2]byte
+	knowClientConnID bool
+	// nameBroadcastStarted guards beginSimulatedNameBroadcast against
+	// being kicked off more than once per client - see that method's own
+	// doc comment.
+	nameBroadcastStarted bool
+	// nextNameBroadcastSeq is the next seq value to stamp on an outbound
+	// 03-wrapped message (name-broadcast or the rejection) - see
+	// runSimulatedNameBroadcastLoop's doc comment for why this can't be
+	// hardcoded to a fixed value. Starts at 0, incremented after every
+	// send.
+	nextNameBroadcastSeq uint16
+	// rejected guards against sending the rejection (or anything after
+	// it) more than once per client.
+	rejected bool
+	// lastActivity is a UnixNano timestamp of the most recent send or
+	// receive touching this client - atomic so beginSimulatedHostOpen's
+	// guard (see simulatedClientIdleExpiry) can read it without taking
+	// st.mu, avoiding a lock-ordering dependency between it and
+	// simulatedClientsMu (see beginSimulatedHostOpen's own doc comment
+	// for the bug this exists to fix).
+	lastActivity atomic.Int64
+}
+
+// touch records that this client's entry just saw real activity (a send
+// or a receive) - see lastActivity's own doc comment.
+func (st *simulatedClientState) touch() {
+	st.lastActivity.Store(time.Now().UnixNano())
+}
+
+// idleFor reports how long it's been since touch was last called. A
+// never-touched entry (lastActivity still zero) reports 0, not some huge
+// duration - callers only use this to decide whether an EXISTING entry
+// has gone stale, and a just-created entry is never stale.
+func (st *simulatedClientState) idleFor() time.Duration {
+	last := st.lastActivity.Load()
+	if last == 0 {
+		return 0
+	}
+	return time.Since(time.Unix(0, last))
+}
+
+// simulatedClientIdleExpiry is how long a simulatedClients entry can sit
+// with no activity before beginSimulatedHostOpen treats it as abandoned
+// and starts a genuinely fresh attempt instead of silently doing nothing
+// (see that function's own doc comment for the bug this fixes). Set
+// comfortably past the ~2-minute patience window a real client has been
+// confirmed to wait (docs/lobby/packet-handling-design.md) before giving
+// up and resigning on its own, so a client that's still legitimately
+// waiting is never evicted out from under itself.
+const simulatedClientIdleExpiry = 3 * time.Minute
 
 // closeSession forcibly closes and removes clientAddr's session, the
 // same effect as its backend connection erroring out naturally (that
@@ -784,13 +1913,24 @@ func (p *proxy) run() {
 		// comment), which the old exact-match check would silently
 		// misroute through forwardToBackend instead, treating the
 		// backend's own packet as a brand-new client. IP-only is safe
-		// here specifically because p.backendUDPAddr's IP is always the
-		// backend pod's own address, never a real client's (see
-		// clientTracker's doc comment on why real client addresses never
-		// reach the backend directly to begin with).
-		if p.backendUDPAddr != nil && srcAddr.IP.Equal(p.backendUDPAddr.IP) {
-			p.relayBackendInitiated(payload)
-			continue
+		// here specifically because a host's own IP is never a real
+		// client's (see clientTracker's doc comment on why real client
+		// addresses never reach the backend directly to begin with).
+		//
+		// N-host update: was a single p.backendUDPAddr equality check;
+		// now a pool lookup, since there's more than one legitimate
+		// backend IP to recognize. Which host matched is threaded into
+		// relayBackendInitiated so it scopes its client search to that
+		// host's own sessions only - searching every host's sessions
+		// indiscriminately here is exactly the kind of cross-match
+		// misattribution this whole N-host pass exists to prevent (see
+		// otherSessionClientAddr's doc comment for the same concern on
+		// the pairing side).
+		if p.detectBackendOrigin {
+			if host, ok := p.pool.hostForBackendIP(srcAddr.IP); ok {
+				p.relayBackendInitiated(payload, host)
+				continue
+			}
 		}
 
 		if p.onClientPacket != nil {
@@ -801,14 +1941,22 @@ func (p *proxy) run() {
 }
 
 // sessionClientAddrForIP returns the real client address (on this proxy's
-// own port) of an existing session belonging to ip, or nil if none does.
-// Used by relayBackendInitiated to turn clientTracker's IP-only-trustworthy
-// address into the right session when more than one might exist.
-func (p *proxy) sessionClientAddrForIP(ip net.IP) *net.UDPAddr {
+// own port) of an existing session belonging to ip *and assigned to
+// host*, or nil if none does. Used by relayBackendInitiated to turn
+// clientTracker's IP-only-trustworthy address into the right session
+// when more than one might exist.
+//
+// N-host update: now filters by host too, not just ip. Without this, two
+// different real clients on two different hosts that happen to share
+// clientTracker's IP hint (or, worse, two clients whose sessions both
+// exist but only one belongs to the host that actually sent this
+// packet) could cross-attribute a backend broadcast to the wrong match
+// entirely - the exact per-host isolation this whole pass exists for.
+func (p *proxy) sessionClientAddrForIP(ip net.IP, host *hostCandidate) *net.UDPAddr {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, sess := range p.sessions {
-		if sess.clientAddr != nil && sess.clientAddr.IP.Equal(ip) {
+		if sess.host == host && sess.clientAddr != nil && sess.clientAddr.IP.Equal(ip) {
 			return sess.clientAddr
 		}
 	}
@@ -817,14 +1965,20 @@ func (p *proxy) sessionClientAddrForIP(ip net.IP) *net.UDPAddr {
 
 // sessionClientAddrForConnID returns the real client address of the
 // session whose learned backend conn-ID (session.connID, see
-// wrapperConnID) matches id, or nil if none is known yet. Added
-// 2026-08-12 as relayBackendInitiated's primary attribution method - see
-// that function's doc comment for why this is more reliable than the
-// IP-recency guessing it previously relied on exclusively.
-func (p *proxy) sessionClientAddrForConnID(id [2]byte) *net.UDPAddr {
+// wrapperConnID) matches id *and which belongs to host*, or nil if none
+// is known yet. Added 2026-08-12 as relayBackendInitiated's primary
+// attribution method - see that function's doc comment for why this is
+// more reliable than the IP-recency guessing it previously relied on
+// exclusively. Host-scoped as of the N-host pass - a conn-ID is only
+// guaranteed unique *per host*, not across the whole pool, since it's
+// each backend's own counter.
+func (p *proxy) sessionClientAddrForConnID(id [2]byte, host *hostCandidate) *net.UDPAddr {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, sess := range p.sessions {
+		if sess.host != host {
+			continue
+		}
 		sess.mu.Lock()
 		known := sess.connIDKnown && sess.connID == id
 		sess.mu.Unlock()
@@ -835,33 +1989,67 @@ func (p *proxy) sessionClientAddrForConnID(id [2]byte) *net.UDPAddr {
 	return nil
 }
 
-// anySessionClientAddr returns the real client address of any one existing
-// session - only used by relayBackendInitiated as a last-resort guess when
-// clientTracker doesn't point at a session of its own (see that method).
-func (p *proxy) anySessionClientAddr() *net.UDPAddr {
+// anySessionClientAddr returns the real client address of any one
+// existing session belonging to host - only used by relayBackendInitiated
+// as a last-resort guess when clientTracker doesn't point at a session of
+// its own (see that method). Host-scoped as of the N-host pass - an
+// unscoped "any session at all" guess would happily hand a host A
+// broadcast to a client actually playing on host B.
+func (p *proxy) anySessionClientAddr(host *hostCandidate) *net.UDPAddr {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, sess := range p.sessions {
-		if sess.clientAddr != nil {
+		if sess.host == host && sess.clientAddr != nil {
 			return sess.clientAddr
 		}
 	}
 	return nil
 }
 
+// sessionCountForHost returns how many of this proxy's currently-tracked
+// sessions belong to host - used by hostPool.selectLocked to tell
+// "empty" from "waiting for a second player" apart (see that method's
+// doc comment). Only meaningful called on sessionProxy - discoveryProxy's
+// own sessions are ephemeral per-query traffic, not real per-client
+// occupancy, so wiring this to discoveryProxy instead would misclassify
+// hosts. Counts idle-but-not-yet-reaped sessions too (up to
+// idleTimeout's staleness window) - same acceptable imprecision every
+// other idle-timeout-adjacent signal in this file already has.
+func (p *proxy) sessionCountForHost(host *hostCandidate) int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, sess := range p.sessions {
+		if sess.host == host {
+			n++
+		}
+	}
+	return n
+}
+
 // otherSessionClientAddr returns the real address of the one session in
-// p.sessions besides skip - used by the 0x29 new-peer-broadcast rewrite to
-// find the newly-joined peer's real address from sessionProxy's own
-// session map, since the broadcast's own embedded address is never
-// usable directly (see newPeerBroadcast's doc comment). Safe to assume at
-// most one "other" session exists: this project only ever hosts 1v1s
-// (host + exactly two real clients, see CLAUDE.md's Goals), so besides
-// skip there's never more than one candidate.
-func (p *proxy) otherSessionClientAddr(skip *net.UDPAddr) *net.UDPAddr {
+// p.sessions besides skip that's also assigned to the same host as skip -
+// used by the 0x29 new-peer-broadcast rewrite to find the newly-joined
+// peer's real address from sessionProxy's own session map, since the
+// broadcast's own embedded address is never usable directly (see
+// newPeerBroadcast's doc comment). Safe to assume at most one "other"
+// session exists *within one host's match*: this project only ever hosts
+// 1v1s (host + exactly two real clients, see CLAUDE.md's Goals), so
+// besides skip there's never more than one candidate *for that host*.
+//
+// N-host update (this is the single most important fix in this pass):
+// previously scanned every session on the proxy with no host filter at
+// all - harmless with one host (there was only ever one "other" to find,
+// full stop), but with two concurrent matches this would have handed
+// clienta (host A) whichever session Go's map iteration happened to hit
+// first, including a client actually playing on host B. That's not a
+// crash or a dropped packet, it's a silently wrong pairing - exactly the
+// failure mode flagged before starting this work.
+func (p *proxy) otherSessionClientAddr(skip *net.UDPAddr, host *hostCandidate) *net.UDPAddr {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for _, sess := range p.sessions {
-		if sess.clientAddr == nil {
+		if sess.host != host || sess.clientAddr == nil {
 			continue
 		}
 		if sess.clientAddr.IP.Equal(skip.IP) && sess.clientAddr.Port == skip.Port {
@@ -870,6 +2058,25 @@ func (p *proxy) otherSessionClientAddr(skip *net.UDPAddr) *net.UDPAddr {
 		return sess.clientAddr
 	}
 	return nil
+}
+
+// sessionSinZero looks up addr's own learned self-reported sin_zero
+// (session.selfSinZero) - used by rewriteToClient's isNewPeerBroadcast/
+// isExistingPeerBroadcast branches to describe addr correctly in a
+// broadcast sent to its peer, rather than trusting whatever sin_zero the
+// host happened to embed (see those branches' own doc comments). Returns
+// ok=false if no session is known for addr yet, or its sin_zero hasn't
+// been learned from real traffic yet.
+func (p *proxy) sessionSinZero(addr *net.UDPAddr) (sinZero [8]byte, ok bool) {
+	p.mu.Lock()
+	sess, exists := p.sessions[addr.String()]
+	p.mu.Unlock()
+	if !exists {
+		return sinZero, false
+	}
+	sess.mu.Lock()
+	defer sess.mu.Unlock()
+	return sess.selfSinZero, sess.selfSinZeroKnown
 }
 
 // pollOtherSessionClientAddr is otherSessionClientAddr, retried for up to
@@ -895,10 +2102,10 @@ func (p *proxy) otherSessionClientAddr(skip *net.UDPAddr) *net.UDPAddr {
 // armed to expect them. Polling here means the callers can synthesize
 // the rewrite themselves the moment the session appears, instead of
 // depending on the host to resend anything.
-func (p *proxy) pollOtherSessionClientAddr(skip *net.UDPAddr, pollTimeout, pollInterval time.Duration) *net.UDPAddr {
+func (p *proxy) pollOtherSessionClientAddr(skip *net.UDPAddr, host *hostCandidate, pollTimeout, pollInterval time.Duration) *net.UDPAddr {
 	deadline := time.Now().Add(pollTimeout)
 	for {
-		if other := p.otherSessionClientAddr(skip); other != nil {
+		if other := p.otherSessionClientAddr(skip, host); other != nil {
 			return other
 		}
 		if time.Now().After(deadline) {
@@ -953,33 +2160,43 @@ func (p *proxy) pollOtherSessionClientAddr(skip *net.UDPAddr, pollTimeout, pollI
 //     port, so effectively a no-op send, but harmless and better than
 //     dropping the packet outright (matches pre-fix behavior for the
 //     single-client bootstrap case).
-func (p *proxy) relayBackendInitiated(payload []byte) {
+//
+// host is which pool member sent this (resolved by run() via
+// pool.hostForBackendIP before calling this) - every fallback tier below
+// that searches p.sessions now scopes that search to host, so a packet
+// from host A can never get attributed to a client actually playing on
+// host B. Tier 4 (the tracker's raw address) is the one exception: it's
+// only reached when there are no sessions on this proxy for *any* host
+// yet, so there's nothing to scope against - same "wrong port, harmless
+// no-op" caveat as before N-host support.
+func (p *proxy) relayBackendInitiated(payload []byte, host *hostCandidate) {
 	var clientAddr *net.UDPAddr
 	if id, ok := wrapperConnID(payload); ok {
-		clientAddr = p.sessionClientAddrForConnID(id)
+		clientAddr = p.sessionClientAddrForConnID(id, host)
 	}
 	if clientAddr == nil {
 		if recent := p.tracker.get(); recent != nil {
-			clientAddr = p.sessionClientAddrForIP(recent.IP)
+			clientAddr = p.sessionClientAddrForIP(recent.IP, host)
 		}
 	}
 	if clientAddr == nil {
-		clientAddr = p.anySessionClientAddr()
+		clientAddr = p.anySessionClientAddr(host)
 	}
 	if clientAddr == nil {
 		clientAddr = p.tracker.get()
 	}
 	if clientAddr == nil {
-		log.Printf("[%s] backend sent unsolicited data but no client seen yet, dropping", p.name)
+		log.Printf("[%s] backend %s sent unsolicited data but no client seen yet, dropping", p.name, host.id)
 		return
 	}
 	out := payload
 	if p.rewriteToClient != nil {
 		// No real *session exists for this direction (see the doc comment
-		// above) - just enough of one to carry the real client's address,
-		// which rewriteToClient needs for the session handshake's "peer"
-		// field.
-		out = p.rewriteToClient(payload, p.cfg, &session{clientAddr: clientAddr})
+		// above) - just enough of one to carry the real client's address
+		// and host, which rewriteToClient needs for the session
+		// handshake's "peer" field and for looking up the right
+		// per-host matchState respectively.
+		out = p.rewriteToClient(payload, p.cfg, &session{clientAddr: clientAddr, host: host})
 	}
 	if _, err := p.clientConn.WriteToUDP(out, clientAddr); err != nil {
 		log.Printf("[%s] relay backend-initiated packet to client %s: %v", p.name, clientAddr, err)
@@ -991,11 +2208,98 @@ func (p *proxy) forwardToBackend(clientAddr *net.UDPAddr, payload []byte) {
 
 	p.mu.Lock()
 	sess, ok := p.sessions[key]
+	p.mu.Unlock()
+
 	if !ok {
-		backendUDPAddr, err := net.ResolveUDPAddr("udp", p.backendAddr)
+		// Host selection + dialing happen here, on this client's first
+		// packet through this proxy - deliberately OUTSIDE p.mu (see
+		// correction below). See proxy.selectHost's own doc comment for
+		// why discoveryProxy and sessionProxy plug in different behavior
+		// here (sessionProxy's call is the real matchmaking decision,
+		// discoveryProxy's is a non-committing peek).
+		//
+		// Correction (2026-08-14): this used to hold p.mu across this
+		// entire branch, including selectHost and the blocking DialUDP
+		// call - wrong on two counts. First, plain lock-hygiene: no
+		// proxy-internal reason blocking I/O needs to happen under this
+		// lock, and holding it that long serializes every other client's
+		// packets behind one new client's dial. Second, and what actually
+		// surfaced it: sessionProxy's selectHost (pool.assignForClient) can
+		// call back into sessionProxy.sessionCountForHost (see hostPool's
+		// selectLocked), which takes this exact same p.mu - a guaranteed
+		// self-deadlock (Go's sync.Mutex isn't reentrant) the moment
+		// sessionProxy's own call is the first one to reach
+		// selectLocked's real logic rather than assignForClient's cached
+		// fast path. That only started happening once discovery-time
+		// assignment was removed (see hostPool.peekHost's doc comment) -
+		// before that, discoveryProxy always populated pool.assigned
+		// first, so this path was dormant. Reproduced live: the whole
+		// status HTTP server wedged too, since the deadlocked goroutine
+		// never reached assignForClient's own deferred pool.mu.Unlock()
+		// either.
+		host, ok := p.selectHost(clientAddr.IP.String())
+		if !ok {
+			// No eligible host (pool empty, or every host full) - synthesize
+			// a host's own responses rather than silently dropping the
+			// client's packet. Real production behavior, not test-only
+			// scaffolding (promoted from behind SIMULATE_FULL_LOBBY
+			// 2026-08-18 - see lobby/packet-handling-design.md's "Case 3 in
+			// detail" section for the byte-level justification of every
+			// synthesized message below). Sends directly on p.clientConn
+			// (this proxy's shared client-facing socket) rather than
+			// through the normal per-session backendConn machinery, since
+			// there's deliberately no real backend involved.
+			switch p.name {
+			case "discovery":
+				// The client's LAN-browse/Direct-Connect screen fires
+				// two genuinely different query types on this port,
+				// not just one - the 0x25 enumerate query and a
+				// separate 0x20 liveness ping (see
+				// synthesizeEmptyPoolPingReply's own doc comment for
+				// the live bug this distinction fixes). Reply with
+				// the shape that actually matches what was asked.
+				var queryType byte
+				if len(payload) > 0 {
+					queryType = payload[0]
+				}
+				var out []byte
+				if queryType == 0x20 {
+					out = synthesizeEmptyPoolPingReply(p.cfg)
+					// Real host capture (2026-08-17) confirmed the host
+					// proactively opens the session-port handshake right
+					// around this point, unprompted - see
+					// onDiscoveryPingNoHost's own doc comment. Fire-and-
+					// forget: does nothing if already kicked off for
+					// this client (retried pings are common).
+					if p.onDiscoveryPingNoHost != nil {
+						// The client's own self-described sockaddr sits
+						// at payload offset 5 (5-byte 0x20 header), its
+						// sin_zero within that at offset 5+8=13, 8 bytes -
+						// see synthesizedSockaddr's doc comment (corrected
+						// 2026-08-18) for why this must be learned and
+						// echoed back, not invented.
+						var clientSinZero [8]byte
+						if len(payload) >= 21 {
+							copy(clientSinZero[:], payload[13:21])
+						}
+						p.onDiscoveryPingNoHost(clientAddr.IP, clientSinZero)
+					}
+				} else {
+					out = synthesizeEmptyPoolDiscoveryReply(p.cfg)
+				}
+				log.Printf("[%s] no eligible host: sending synthesized reply (query type 0x%02x) to client %s", p.name, queryType, key)
+				if _, err := p.clientConn.WriteToUDP(out, clientAddr); err != nil {
+					log.Printf("[%s] sending synthesized discovery reply to %s: %v", p.name, key, err)
+				}
+			case "session":
+				p.simulateSessionPacket(clientAddr, payload)
+			}
+			return
+		}
+		backendAddr := p.backendAddrForHost(host)
+		backendUDPAddr, err := net.ResolveUDPAddr("udp", backendAddr)
 		if err != nil {
-			p.mu.Unlock()
-			log.Printf("[%s] resolving backend %s: %v", p.name, p.backendAddr, err)
+			log.Printf("[%s] resolving backend %s (%s): %v", p.name, host.id, backendAddr, err)
 			return
 		}
 		// Bind the backend-facing socket to our own known public IP
@@ -1009,17 +2313,15 @@ func (p *proxy) forwardToBackend(clientAddr *net.UDPAddr, payload []byte) {
 		localAddr := &net.UDPAddr{IP: net.IP(p.cfg.publicIP[:])}
 		backendConn, err := net.DialUDP("udp", localAddr, backendUDPAddr)
 		if err != nil {
-			p.mu.Unlock()
-			log.Printf("[%s] dialing backend %s for client %s: %v", p.name, p.backendAddr, key, err)
+			log.Printf("[%s] dialing backend %s (%s) for client %s: %v", p.name, host.id, backendAddr, key, err)
 			return
 		}
-		sess = &session{backendConn: backendConn, clientAddr: clientAddr, lastSeen: time.Now()}
+		sess = &session{backendConn: backendConn, clientAddr: clientAddr, host: host, lastSeen: time.Now()}
+		p.mu.Lock()
 		p.sessions[key] = sess
 		p.mu.Unlock()
-		log.Printf("[%s] new session: client %s -> backend %s", p.name, key, p.backendAddr)
+		log.Printf("[%s] new session: client %s -> %s (%s)", p.name, key, host.id, backendAddr)
 		go p.backendToClient(key, clientAddr, sess)
-	} else {
-		p.mu.Unlock()
 	}
 
 	sess.mu.Lock()
@@ -1032,6 +2334,356 @@ func (p *proxy) forwardToBackend(clientAddr *net.UDPAddr, payload []byte) {
 	}
 	if _, err := sess.backendConn.Write(out); err != nil {
 		log.Printf("[%s] write to backend for client %s: %v", p.name, key, err)
+	}
+}
+
+// beginSimulatedHostOpen proactively sends the host-initiated self/peer-
+// open toward a client on the session port, without waiting for the
+// client to speak on 2300 first - only sessionProxy calls this
+// meaningfully (wired via onDiscoveryPingNoHost in main()), even though
+// it's a method on *proxy like everything else here.
+//
+// This was the missing piece behind the whole "client never sends its
+// own 0x02" investigation. Found 2026-08-17 by diffing a freshly-
+// captured genuine success (both host's and joiner's own vantage points
+// independently, archiving/sessions/20260817-212506-session-
+// establishment-investigation) against what this proxy's own reactive-
+// only simulateSessionPacket does: the real host sends the first 0x00
+// completely unprompted - zero prior packets from the client on port
+// 2300 at all - roughly 8 times over ~700ms, and only THEN does the
+// joiner answer, with its own 0x02 (not a 0x00 - it doesn't send its own
+// self/peer-open until immediately after that). This proxy's dispatch
+// only ever reacted to something the client sent first, which is
+// backwards from what a real host does, and left the client waiting
+// forever for an open that would never come. The client's session-port
+// address is always clientIP:2300 by convention (confirmed live - both
+// sides use the fixed port, not an ephemeral one), so the client's IP
+// alone (known as soon as it pings discovery) is enough to start this;
+// no extra address discovery needed.
+//
+// clientSinZero is the client's own self-reported sin_zero, learned
+// from its 0x20 ping - see synthesizedSockaddr's own doc comment
+// (corrected 2026-08-18) for why the "peer" sockaddr block below must
+// echo this back exactly rather than use an invented value.
+//
+// Correction (2026-08-18): the guard below used to be a permanent
+// "already have an entry for this key, do nothing" check that never
+// expired - once ANY discovery ping from a given client IP created a
+// simulatedClients entry, every subsequent ping from that same IP,
+// forever (this map has no other cleanup), silently returned without
+// ever sending another proactive open, even if the first attempt timed
+// out completely unanswered. Found by diffing a synthesis capture taken
+// against a long-lived aom-lobby pod (already fielding earlier test
+// sessions against the same client IP) against the code path here: the
+// capture showed zero proactive 0x00 sends at all, only a reactive 0x02
+// once the client gave up waiting and opened on its own - exactly what
+// this stale guard produces. In production this is a real bug, not just
+// a testing artifact: any player whose first Direct-Connect attempt
+// fails and who retries would hit this same permanently-stuck guard on
+// every attempt after the first, for as long as the pod stays up. Now
+// an existing entry only blocks a fresh attempt while it's genuinely
+// still active (idleFor() < simulatedClientIdleExpiry); a stale one is
+// evicted and replaced instead of silently doing nothing.
+func (p *proxy) beginSimulatedHostOpen(clientIP net.IP, clientSinZero [8]byte) {
+	sessionAddr := &net.UDPAddr{IP: clientIP, Port: int(p.cfg.publicPort)}
+	key := sessionAddr.String()
+
+	p.simulatedClientsMu.Lock()
+	if p.simulatedClients == nil {
+		p.simulatedClients = make(map[string]*simulatedClientState)
+	}
+	if existing, ok := p.simulatedClients[key]; ok {
+		existing.mu.Lock()
+		terminal := existing.rejected
+		existing.mu.Unlock()
+		// A rejected session is done, not stuck - live-tested 2026-08-19: a
+		// client that gets rejected and immediately retries (completely
+		// normal real-player behavior, e.g. right after seeing "Host game
+		// is full") would otherwise sit blocked for up to
+		// simulatedClientIdleExpiry, since that timer is sized for "how
+		// long to wait before assuming an UNANSWERED attempt was
+		// abandoned" - the wrong yardstick for a session that already
+		// reached a clean terminal state in under a second. Don't make a
+		// legitimate immediate retry wait out a timer meant for a
+		// different problem.
+		if !terminal && existing.idleFor() < simulatedClientIdleExpiry {
+			p.simulatedClientsMu.Unlock()
+			return // already kicked off (or already talking) for this client, still active
+		}
+		// Stale (idle past the point any real client would still be
+		// waiting) or terminal (already rejected) - either way, treat this
+		// ping as a genuinely fresh attempt instead of a continuation of
+		// the old one.
+		delete(p.simulatedClients, key)
+	}
+	st := &simulatedClientState{}
+	st.touch()
+	p.simulatedClients[key] = st
+	p.simulatedClientsMu.Unlock()
+
+	go func() {
+		var clientIP4 [4]byte
+		copy(clientIP4[:], sessionAddr.IP.To4())
+		open := synthesizeSelfPeerOpen(fakeHostConnID, p.cfg.publicIP, p.cfg.publicPort, clientIP4, uint16(sessionAddr.Port), clientSinZero)
+
+		// Real host retried ~8x over ~700ms (roughly every 100ms) before
+		// the joiner answered - match that cadence, and stop early once
+		// the client's own reply arrives (learned via simulateSessionPacket
+		// setting knowClientConnID/rejected on this same st).
+		for i := 0; i < 20; i++ {
+			st.mu.Lock()
+			done := st.knowClientConnID || st.rejected
+			st.mu.Unlock()
+			if done {
+				return
+			}
+			if _, err := p.clientConn.WriteToUDP(open, sessionAddr); err != nil {
+				log.Printf("[%s] no-eligible-host: proactive host-open to %s: %v", p.name, key, err)
+			}
+			st.touch()
+			time.Sleep(100 * time.Millisecond)
+		}
+	}()
+}
+
+// beginSimulatedNameBroadcast proactively sends the host's own name-
+// broadcast once the connID exchange (0x00/0x02) is mutually complete,
+// instead of waiting for the client to send its own 0x03 first - same
+// missing-proactive-step bug as beginSimulatedHostOpen, one layer up the
+// protocol, found the same way: the 2026-08-17 retest of that first fix
+// showed the 0x00/0x02 exchange completing correctly, then the
+// connection settling into a pure 07ff heartbeat loop forever - never
+// progressing to 0x03 on either side. The real capture's own timeline
+// explains why: the host sends its own 0x03 first (54.468042, ~84ms
+// after both sides' 0x02 acks), and only then does the joiner reply
+// with its own 0x03 (54.477559) - the client was waiting on the host to
+// speak first here too, exactly like the connection-open phase.
+//
+// Guard-and-set (st.nameBroadcastStarted) is the CALLER's job, done
+// under the same st.mu lock simulateSessionPacket already holds when it
+// decides to call this - st.mu must NOT be locked again in here, only
+// by runSimulatedNameBroadcastLoop's own periodic check, which runs
+// later in its own goroutine after the caller has returned/unlocked.
+func (p *proxy) beginSimulatedNameBroadcast(clientAddr *net.UDPAddr, st *simulatedClientState) {
+	go p.runSimulatedNameBroadcastLoop(clientAddr, st)
+}
+
+// Sends a fresh seq value each retry, not a fixed 0 - a real host's own
+// retries were confirmed (2026-08-18, lobby/packet-handling-design.md's
+// "Case 3 in detail" section) to vary seq across sends (0, 1, 0 in that
+// capture) rather than resending byte-identical packets. This codebase
+// doesn't know the real rule (only one, non-monotonic sample exists),
+// but a plain incrementing counter is a closer match than a frozen
+// constant, which is what shipped here before this fix.
+//
+// Waits BEFORE sending too, not just between retries - corrected
+// 2026-08-18 after finding a real host's own ack-to-name-broadcast gap
+// is consistently ~84-100ms across two independent captures (never
+// instant), while this proxy's own first send used to fire in the same
+// instant as the ack that triggers it (~0.2ms gap, confirmed live -
+// roughly 500x faster than any real host). Plausible mechanism: AoM's
+// own lobby-state update loop runs at a leisurely ~2-5Hz (a real client
+// only checks for incoming lobby updates a few times a second, not
+// continuously), so two logically-distinct messages arriving within
+// microseconds of each other land in the exact same processing cycle
+// from the client's own perspective, rather than as two separate
+// events - see lobby/packet-handling-design.md for the full reasoning.
+// Pacing every send to roughly one per real host tick, starting with
+// the very first one, is a closer match to what a real host's own
+// sending cadence actually looks like.
+func (p *proxy) runSimulatedNameBroadcastLoop(clientAddr *net.UDPAddr, st *simulatedClientState) {
+	for i := 0; i < 20; i++ {
+		time.Sleep(100 * time.Millisecond)
+		st.mu.Lock()
+		done := st.rejected
+		seq := st.nextNameBroadcastSeq
+		st.nextNameBroadcastSeq++
+		st.mu.Unlock()
+		if done {
+			return
+		}
+		// A real host bundles an UNPROMPTED heartbeat with each name-
+		// broadcast (retry) send, not just the first one - confirmed
+		// 2026-08-18 from the host's own vantage point of the reference
+		// capture: heartbeat then name-broadcast, only 0.3ms apart, both
+		// on the same ~100ms tick. This proxy used to only ever send
+		// 07ff reactively (in response to a client's own heartbeat) -
+		// meaning at the exact tick where a real host proactively
+		// signals "I'm alive and about to speak", this one stayed silent
+		// on that specific signal. Order matches the real capture:
+		// heartbeat first, then name-broadcast.
+		hb := synthesizeHeartbeat(fakeHostConnID)
+		if _, err := p.clientConn.WriteToUDP(hb, clientAddr); err != nil {
+			log.Printf("[%s] no-eligible-host: proactive heartbeat to %s: %v", p.name, clientAddr.String(), err)
+		}
+		nb := synthesizeNameBroadcast(fakeHostConnID, seq, simulatedFullLobbyCrackSignature)
+		if _, err := p.clientConn.WriteToUDP(nb, clientAddr); err != nil {
+			log.Printf("[%s] no-eligible-host: proactive name-broadcast to %s: %v", p.name, clientAddr.String(), err)
+		}
+		st.touch()
+	}
+}
+
+// resetIfStaleConnID learns connIDBytes as st's clientConnID, resetting
+// the rest of st's fields first if this is actually a NEW session
+// reusing an old one's key rather than a retry of the same session.
+// Returns true the first time a given connID is learned (for the
+// caller's own "just learned it" log line) - false on every subsequent
+// retry with the same connID.
+//
+// Found live 2026-08-18, back-to-back testing the always-on no-
+// eligible-host synthesis path (promoted from behind SIMULATE_FULL_LOBBY
+// the same day): classic DirectPlay's session port is always 2300 on
+// both sides (see beginSimulatedHostOpen's doc comment), so
+// simulatedClients' key (clientAddr.String(), i.e. "ip:2300") is
+// entirely IP-derived - a genuinely new connection attempt from the
+// same IP (a real client reconnecting, or - what actually happened here
+// - Docker handing a fresh test container the same IP a prior one had)
+// reuses the exact same map key. Without this check, the old
+// simulatedClientState (already knowClientConnID=true from the PRIOR
+// session) just kept echoing the stale old connID back to the new
+// client forever, which a real client's own validation would have every
+// reason to reject - this was masking as part of the deeper "client
+// never sends its own 0x02" mystery when it's actually a separate,
+// simpler bug.
+func resetIfStaleConnID(st *simulatedClientState, connIDBytes []byte) bool {
+	var connID [2]byte
+	copy(connID[:], connIDBytes)
+	if st.knowClientConnID && st.clientConnID == connID {
+		return false
+	}
+	if st.knowClientConnID {
+		// A genuinely new session reusing this address - not this
+		// client's first packet, but the state below is now
+		// meaningless. Doesn't cancel an in-flight
+		// runSimulatedNameBroadcastLoop from the old session (it
+		// self-stops once IT sees rejected/its own 20-iteration cap);
+		// harmless overlap, not worth a cancellation channel here.
+		st.rejected = false
+		st.nameBroadcastStarted = false
+		st.nextNameBroadcastSeq = 0
+	}
+	st.clientConnID = connID
+	st.knowClientConnID = true
+	return true
+}
+
+// simulateSessionPacket is the reactive handshake sent whenever there's
+// no eligible host - see simulatedClientState's own doc comment for why
+// this reacts to the client's own packets instead of running a fixed
+// timer-driven script. Called from forwardToBackend's "no eligible
+// host" branch for every session-port packet a client sends while
+// there's no real backend at all.
+func (p *proxy) simulateSessionPacket(clientAddr *net.UDPAddr, payload []byte) {
+	key := clientAddr.String()
+
+	p.simulatedClientsMu.Lock()
+	if p.simulatedClients == nil {
+		p.simulatedClients = make(map[string]*simulatedClientState)
+	}
+	st, ok := p.simulatedClients[key]
+	if !ok {
+		st = &simulatedClientState{}
+		p.simulatedClients[key] = st
+	}
+	p.simulatedClientsMu.Unlock()
+
+	st.touch()
+
+	st.mu.Lock()
+	defer st.mu.Unlock()
+
+	if st.rejected {
+		return
+	}
+
+	send := func(stage string, b []byte) {
+		if _, err := p.clientConn.WriteToUDP(b, clientAddr); err != nil {
+			log.Printf("[%s] no-eligible-host: sending %s to %s: %v", p.name, stage, key, err)
+		}
+	}
+
+	switch {
+	case len(payload) >= 6 && payload[0] == 0x00 && payload[1] == 0x00:
+		// Client's own self/peer-open - the "mirrored" open it sends
+		// (right after its own 0x02 ack, once the host opened first) or,
+		// in principle, one it sends unprompted.
+		//
+		// Correction (2026-08-17): this used to echo back ANOTHER 0x00,
+		// which is backwards - confirmed identically in two independent
+		// real captures (2026-08-15's lobby-full-rejection session and
+		// 2026-08-17's session-establishment one) that a received 0x00 is
+		// always answered with a 0x02 ack, never with another 0x00.
+		// Concretely: in both captures, whichever side sends 0x00 first
+		// gets ~6-8 unanswered retries over ~600-700ms (the recipient
+		// stays completely silent - it's the SENDER's own internal
+		// timeout driving the retries, not anything the recipient is
+		// withholding), and the very first reply that ever arrives is a
+		// 0x02, not a 0x00. This branch mistakenly modeled "answered
+		// every single one" as "replied to every retry in kind" - it
+		// actually meant "every 0x00 this proxy received (from whichever
+		// exchange) eventually got one ack", not "reply with 0x00".
+		if resetIfStaleConnID(st, payload[2:4]) {
+			log.Printf("[%s] no-eligible-host: learned connID %x from client %s's self/peer-open, replying in kind", p.name, st.clientConnID, key)
+		}
+		send("handshake ack", synthesizeHandshakeAck(fakeHostConnID, st.clientConnID))
+		if !st.nameBroadcastStarted {
+			st.nameBroadcastStarted = true
+			p.beginSimulatedNameBroadcast(clientAddr, st)
+		}
+
+	case len(payload) >= 2 && payload[0] == 0x07 && payload[1] == 0xff && st.knowClientConnID:
+		// Client's own "07ff" heartbeat/ack (see
+		// docs/directplay8-packet-classification.md's confirmed-shapes
+		// table) - the real capture showed the host answering these too,
+		// periodically, alongside the 0x00 retries; this proxy's own
+		// reactive loop never sent any at all until this was added,
+		// found live 2026-08-15 by re-capturing the client's own
+		// traffic and noticing it kept sending these with no reply.
+		send("heartbeat", synthesizeHeartbeat(fakeHostConnID))
+
+	case len(payload) >= 6 && payload[0] == 0x02 && payload[1] == 0x00:
+		// Client's own handshake ack. Learn its connID here too, not
+		// just from a client-sent 0x00 - confirmed live 2026-08-17 (see
+		// beginSimulatedHostOpen's doc comment) that once the host opens
+		// first, the client's very FIRST packet on this port is its own
+		// 0x02, not a 0x00; requiring knowClientConnID already true (as
+		// this case used to) meant this branch could never fire at all
+		// in that ordering.
+		if resetIfStaleConnID(st, payload[2:4]) {
+			log.Printf("[%s] no-eligible-host: learned connID %x from client %s's handshake ack, replying in kind", p.name, st.clientConnID, key)
+		}
+		send("handshake ack", synthesizeHandshakeAck(fakeHostConnID, st.clientConnID))
+		if !st.nameBroadcastStarted {
+			st.nameBroadcastStarted = true
+			p.beginSimulatedNameBroadcast(clientAddr, st)
+		}
+
+	case len(payload) >= 6 && payload[0] == 0x03 && payload[1] == 0x00 && st.knowClientConnID:
+		// Client's own 03-wrapped broadcast - during this fake
+		// sequence, the only thing a genuinely-connecting client sends
+		// on this port shaped like this is its own name-broadcast (see
+		// synthesizeNameBroadcast's doc comment on scope: ready-toggle/
+		// resign only happen later, in a real match this session never
+		// reaches). Reply with the host's own name-broadcast, then -
+		// matching the real capture's own shape, where the rejection
+		// followed directly after the joiner announced its name - send
+		// the rejection right after. Both seq values continue counting
+		// up from st.nextNameBroadcastSeq (shared with
+		// runSimulatedNameBroadcastLoop's own retries) rather than using
+		// fixed 0/1 - matches the real capture's own pattern, where the
+		// rejection's seq was one past whatever the host's own name-
+		// broadcast retries had last used, not an independent constant
+		// (see lobby/packet-handling-design.md's "Case 3 in detail",
+		// corrected 2026-08-18).
+		nameSeq := st.nextNameBroadcastSeq
+		st.nextNameBroadcastSeq++
+		rejectSeq := st.nextNameBroadcastSeq
+		st.nextNameBroadcastSeq++
+		send("name-broadcast", synthesizeNameBroadcast(fakeHostConnID, nameSeq, simulatedFullLobbyCrackSignature))
+		send("lobby-full rejection", synthesizeLobbyFullRejection(fakeHostConnID, rejectSeq))
+		st.rejected = true
+		log.Printf("[%s] no-eligible-host: sent lobby-full rejection to client %s", p.name, key)
 	}
 }
 
@@ -1074,32 +2726,58 @@ func (p *proxy) backendToClient(key string, clientAddr *net.UDPAddr, sess *sessi
 	delete(p.sessions, key)
 	p.mu.Unlock()
 	if p.onSessionRemoved != nil {
-		p.onSessionRemoved(clientAddr)
+		p.onSessionRemoved(sess)
 	}
 }
 
+// reapIdleSessions closes sessions that have gone quiet on this proxy's
+// own channel (idleTimeout, checked every reapEvery). Shared by both
+// discoveryProxy and sessionProxy.
+//
+// Cross-channel check (added 2026-08-14, sessionProxy-relevant only):
+// before reaping a host-channel-idle session, check whether its host is
+// already paired (sess.host.match.currentPair()) and, if so, whether
+// this exact client has been active on that pair relay more recently
+// than idleTimeout (pairRelay.idleFor). If the relay says they're still
+// there, skip reaping this cycle - this is exactly the 2026-08-11
+// regression's shape: a client mid-handshake (or just actively playing)
+// with its peer can go quiet on the host channel alone without having
+// left at all. Only once *both* channels have been silent past
+// idleTimeout does this actually remove the session - see
+// proxy.onSessionRemoved's own doc comment for what that then triggers.
+// A session with no host or an unpaired match (sess.host.match.
+// currentPair() == nil) has no second channel to check and reaps exactly
+// as before - this only changes behavior for already-paired matches.
 func (p *proxy) reapIdleSessions() {
 	ticker := time.NewTicker(reapEvery)
 	defer ticker.Stop()
 	for range ticker.C {
 		now := time.Now()
-		var removed []*net.UDPAddr
+		var removed []*session
 		p.mu.Lock()
 		for key, sess := range p.sessions {
 			sess.mu.Lock()
 			idle := now.Sub(sess.lastSeen)
 			sess.mu.Unlock()
-			if idle > idleTimeout {
-				sess.backendConn.Close()
-				delete(p.sessions, key)
-				removed = append(removed, sess.clientAddr)
-				log.Printf("[%s] closed idle session for client %s", p.name, key)
+			if idle <= idleTimeout {
+				continue
 			}
+			if sess.host != nil && sess.host.match != nil {
+				if relay := sess.host.match.currentPair(); relay != nil {
+					if relay.idleFor(sess.clientAddr) <= idleTimeout {
+						continue
+					}
+				}
+			}
+			sess.backendConn.Close()
+			delete(p.sessions, key)
+			removed = append(removed, sess)
+			log.Printf("[%s] closed idle session for client %s", p.name, key)
 		}
 		p.mu.Unlock()
 		if p.onSessionRemoved != nil {
-			for _, addr := range removed {
-				p.onSessionRemoved(addr)
+			for _, sess := range removed {
+				p.onSessionRemoved(sess)
 			}
 		}
 	}
@@ -1169,6 +2847,44 @@ type pairRelay struct {
 	// client<->client resign detection into the same session-teardown
 	// path as client<->host resign detection (see proxy.closeSession).
 	onResign func(peerAddr *net.UDPAddr)
+
+	// mu guards lastSeenA/lastSeenB - per-endpoint activity tracking,
+	// added so reapIdleSessions can tell "genuinely idle on both
+	// channels" from "quiet on the host channel but still actively
+	// exchanging traffic here" before freeing a match's slot - see that
+	// function's own doc comment on the 2026-08-11 regression this
+	// exists to avoid repeating.
+	mu        sync.Mutex
+	lastSeenA time.Time
+	lastSeenB time.Time
+
+	// notified records which real client addresses have definitely
+	// received their own peer-address broadcast - either the genuine one
+	// rewritten from the host, or (if the host's own never showed up in
+	// time) the synthesized fallback - see ensurePairRelay's watchdog and
+	// docs/multi-peer-routing-design.md's "Regression investigation
+	// (2026-08-14)" section for why this exists. Keyed by
+	// clientAddr.String(), guarded by mu above.
+	notified map[string]bool
+}
+
+// markNotified records that addr has received its peer-address
+// broadcast - called both for the genuine reactive-rewrite path (every
+// ensurePairRelay call marks its own selfAddr) and the synthesized
+// fallback path (the watchdog marks otherAddr once it sends). Idempotent.
+func (r *pairRelay) markNotified(addr *net.UDPAddr) {
+	r.mu.Lock()
+	r.notified[addr.String()] = true
+	r.mu.Unlock()
+}
+
+// isNotified reports whether addr has already received its peer-address
+// broadcast - what the watchdog checks before deciding whether to
+// synthesize one.
+func (r *pairRelay) isNotified(addr *net.UDPAddr) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.notified[addr.String()]
 }
 
 // newPairRelay binds a fresh, dynamically-allocated port (never the
@@ -1177,16 +2893,38 @@ type pairRelay struct {
 // starts relaying between addrA and addrB.
 func newPairRelay(name string, cfg config, addrA, addrB *net.UDPAddr) *pairRelay {
 	conn := mustListen(":0")
+	now := time.Now()
 	r := &pairRelay{
-		name:     name,
-		cfg:      cfg,
-		conn:     conn,
-		selfPort: uint16(conn.LocalAddr().(*net.UDPAddr).Port),
-		addrA:    addrA,
-		addrB:    addrB,
+		name:      name,
+		cfg:       cfg,
+		conn:      conn,
+		selfPort:  uint16(conn.LocalAddr().(*net.UDPAddr).Port),
+		addrA:     addrA,
+		addrB:     addrB,
+		lastSeenA: now,
+		lastSeenB: now,
+		notified:  make(map[string]bool),
 	}
 	log.Printf("[%s] new A<->B pair relay on %s:%d, bridging %s <-> %s", name, net.IP(cfg.publicIP[:]), r.selfPort, addrA, addrB)
 	return r
+}
+
+// idleFor reports how long addr has been silent on this relay - used by
+// reapIdleSessions to distinguish a client that's genuinely gone from
+// one that's just quiet on its host-channel session while still active
+// here. An addr matching neither endpoint returns a very large duration
+// deliberately (never protects a session it has no relationship to).
+func (r *pairRelay) idleFor(addr *net.UDPAddr) time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch {
+	case udpAddrEqual(addr, r.addrA):
+		return time.Since(r.lastSeenA)
+	case udpAddrEqual(addr, r.addrB):
+		return time.Since(r.lastSeenB)
+	default:
+		return time.Hour
+	}
 }
 
 func udpAddrEqual(a, b *net.UDPAddr) bool {
@@ -1280,15 +3018,20 @@ func (r *pairRelay) run() {
 		payload := append([]byte(nil), buf[:n]...)
 
 		var dst *net.UDPAddr
+		r.mu.Lock()
 		switch {
 		case udpAddrEqual(src, r.addrA):
 			dst = r.addrB
+			r.lastSeenA = time.Now()
 		case udpAddrEqual(src, r.addrB):
 			dst = r.addrA
+			r.lastSeenB = time.Now()
 		default:
+			r.mu.Unlock()
 			log.Printf("[%s] packet from unexpected sender %s (expected %s or %s), dropping", r.name, src, r.addrA, r.addrB)
 			continue
 		}
+		r.mu.Unlock()
 
 		if isResignBurst(payload) {
 			// Logging only, NOT calling onResign - see isResignBurst's doc
@@ -1307,6 +3050,9 @@ func (r *pairRelay) run() {
 			copy(dstIP[:], dst.IP.To4())
 			out = rewriteSessionField(payload, sessionSelfOffset, r.cfg.publicIP, r.selfPort)
 			out = rewriteSessionField(out, sessionPeerOffset, dstIP, uint16(dst.Port))
+		}
+		if r.cfg.verbose {
+			log.Printf("[%s] relaying %s -> %s (%d bytes): %s", r.name, src, dst, len(payload), hex.EncodeToString(payload))
 		}
 		if _, err := r.conn.WriteToUDP(out, dst); err != nil {
 			log.Printf("[%s] write to %s: %v", r.name, dst, err)
@@ -1348,11 +3094,29 @@ type matchState struct {
 // "Durability" section) but isn't currently wired to fire from anything
 // (see sessionProxy's construction in main() for why: firing it from a
 // plain idle timeout broke the second client's join outright).
+// ensurePairRelay returns the A<->B relay for this match, creating and
+// starting it on first use. selfAddr is whichever real client is the
+// confirmed recipient of the genuine broadcast that triggered this call;
+// otherAddr is its peer.
+//
+// Correction (2026-08-20): this used to also thread a peerBroadcastKind
+// and start a startNewPeerWatchdog fallback in case otherAddr's own
+// mirror-image broadcast never arrived. Removed - the "never arrived"
+// premise was wrong. Both isNewPeerBroadcast and isExistingPeerBroadcast
+// always caught the genuine broadcast, we just weren't recognizing it
+// (see their own doc comments) - the reactive rewrite path below is
+// sufficient on its own now that detection is fixed.
 func (m *matchState) ensurePairRelay(selfAddr, otherAddr *net.UDPAddr) *pairRelay {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	if m.pair != nil {
-		return m.pair
+		relay := m.pair
+		m.mu.Unlock()
+		// Every call - not just the one that creates the relay - marks
+		// its own selfAddr notified: see this method's own doc comment,
+		// selfAddr is always the confirmed recipient of whichever real
+		// broadcast triggered this specific call.
+		relay.markNotified(selfAddr)
+		return relay
 	}
 	relay := newPairRelay("pair", m.cfg, selfAddr, otherAddr)
 	// NOT wiring relay.onResign to m.closeSession right now - see
@@ -1360,6 +3124,8 @@ func (m *matchState) ensurePairRelay(selfAddr, otherAddr *net.UDPAddr) *pairRela
 	// on this shape is currently disabled in both directions.
 	go relay.run()
 	m.pair = relay
+	m.mu.Unlock()
+	relay.markNotified(selfAddr)
 	return relay
 }
 
@@ -1423,6 +3189,16 @@ func (m *matchState) full() bool {
 	return m.pair != nil
 }
 
+// currentPair returns this match's pair relay, or nil if the two real
+// clients haven't been paired yet - used by reapIdleSessions to check a
+// client's peer-relay activity before treating host-channel idleness
+// alone as a departure (see that function's own doc comment).
+func (m *matchState) currentPair() *pairRelay {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pair
+}
+
 // hostReadyX/hostReadyY are the host's own Ready-crystal coordinates in
 // the 800x600 lobby screen - the same control a human host would click,
 // pixel-measured live 2026-08-11 (see docs/host-flow.md). Confirmed to
@@ -1451,6 +3227,7 @@ func (m *matchState) setReady(clientAddr *net.UDPAddr, ready bool) (bothReady bo
 		m.ready = make(map[string]bool)
 	}
 	m.ready[clientAddr.String()] = ready
+	log.Printf("[match] ready state: %v", m.ready)
 	if len(m.ready) < 2 {
 		return false
 	}
@@ -1474,13 +3251,20 @@ func (m *matchState) markStarted() (alreadyStarted bool) {
 	return alreadyStarted
 }
 
-// triggerMatchStart asks input-agent (see input-agent/main.go) to click
-// the host's own Ready crystal, the confirmed match-start trigger. Plain
-// HTTP over the pod network - see the aom-headless-game Service's
-// input-agent port and its doc comment on why this doesn't need
-// SESSION_BACKEND_ADDR's pod-IP-pinning treatment.
-func triggerMatchStart(cfg config) {
-	url := fmt.Sprintf("http://%s/click?x=%d&y=%d", cfg.inputAgentAddr, hostReadyX, hostReadyY)
+// triggerMatchStart asks host's own input-agent (see input-agent/main.go)
+// to click that host's Ready crystal, the confirmed match-start trigger.
+// Plain HTTP over the pod network, straight to that host's own
+// dynamically-discovered podIP:8082 (hostCandidate.inputAgentAddr) - no
+// Service involved, same as every other per-host address in this file.
+//
+// N-host update: used to post to a single fixed cfg.inputAgentAddr: now
+// takes the specific host whose match just went both-ready, and posts to
+// *that* host's own input-agent instead - with a pool of more than one
+// host, the old fixed-address version would have clicked the Ready
+// crystal on an arbitrary host, not necessarily the one that actually
+// just filled up.
+func triggerMatchStart(host *hostCandidate) {
+	url := fmt.Sprintf("http://%s/click?x=%d&y=%d", host.inputAgentAddr, hostReadyX, hostReadyY)
 	resp, err := http.Post(url, "", nil)
 	if err != nil {
 		log.Printf("triggerMatchStart: POST %s: %v", url, err)
@@ -1491,11 +3275,19 @@ func triggerMatchStart(cfg config) {
 		log.Printf("triggerMatchStart: POST %s: unexpected status %s", url, resp.Status)
 		return
 	}
-	log.Printf("triggerMatchStart: clicked host Ready crystal (%d, %d)", hostReadyX, hostReadyY)
+	log.Printf("triggerMatchStart: clicked %s's Ready crystal (%d, %d)", host.id, hostReadyX, hostReadyY)
 }
 
 func main() {
 	cfg := loadConfig()
+
+	// pool starts empty - podLister's reconciliation loop (started below,
+	// once sessionProxy exists to wire podLister.closeSession) fills it
+	// in dynamically as aom-headless pods come and go. See hostPool and
+	// podLister's own doc comments - this replaces the old static,
+	// built-once-at-startup pool entirely.
+	pool := &hostPool{}
+	podLister := newInClusterPodLister(cfg)
 
 	// Shared between both proxies - see clientTracker's doc comment for why
 	// the session proxy needs to know who the discovery proxy last heard
@@ -1503,11 +3295,13 @@ func main() {
 	tracker := &clientTracker{}
 
 	discoveryProxy := &proxy{
-		name:           "discovery",
-		cfg:            cfg,
-		clientConn:     mustListen(cfg.discoveryListenAddr),
-		backendAddr:    cfg.discoveryBackendAddr,
-		onClientPacket: tracker.set,
+		name:               "discovery",
+		cfg:                cfg,
+		clientConn:         mustListen(cfg.discoveryListenAddr),
+		pool:               pool,
+		backendAddrForHost: func(h *hostCandidate) string { return h.discoveryBackendAddr },
+		selectHost:         func(string) (*hostCandidate, bool) { return pool.peekHost() },
+		onClientPacket:     tracker.set,
 		rewriteToClient: func(payload []byte, cfg config, sess *session) []byte {
 			out := discoveryRewrite(payload, cfg)
 			if cfg.verbose && len(out) > 0 {
@@ -1536,49 +3330,45 @@ func main() {
 		sessions: make(map[string]*session),
 	}
 
-	sessionBackendUDPAddr, err := net.ResolveUDPAddr("udp", cfg.sessionBackendAddr)
-	if err != nil {
-		log.Fatalf("resolving SESSION_BACKEND_ADDR %q: %v", cfg.sessionBackendAddr, err)
-	}
-
-	// The A<->B pair relay (see matchState/newPairRelay above) is created
-	// lazily from inside sessionProxy's own rewriteToClient closure below,
-	// which needs to look itself up (to find the newly-joined peer's real
-	// address via otherSessionClientAddr) - hence declaring the variable
-	// before the struct literal that closes over it, rather than the usual
-	// := form.
-	match := &matchState{cfg: cfg}
+	// sessionProxy's own rewriteToClient closure below needs to look
+	// itself up (to find the newly-joined peer's real address via
+	// otherSessionClientAddr) - hence declaring the variable before the
+	// struct literal that closes over it, rather than the usual := form.
 	var sessionProxy *proxy
 	sessionProxy = &proxy{
-		name:           "session",
-		cfg:            cfg,
-		clientConn:     mustListen(cfg.sessionListenAddr),
-		backendAddr:    cfg.sessionBackendAddr,
-		backendUDPAddr: sessionBackendUDPAddr,
-		tracker:        tracker,
-		// Correction (2026-08-12): NOT wiring onSessionRemoved to
-		// match.onClientGone anymore. It was, briefly, and that broke the
-		// second real client's join outright - reproduced live: the
-		// client<->host session for whichever client is mid-handshake can
-		// look idle to reapIdleSessions (idleTimeout, 30s) while that
-		// client is actually busy retrying its P2P handshake through the
-		// just-created pair relay, not sending much toward the host in
-		// that window. That idle reap fired onClientGone, which tore down
-		// the pair relay mid-handshake - and nothing ever rebuilds it,
-		// since the host has no reason to re-announce (our internal
-		// session churn is invisible to it - see clientTracker's doc
-		// comment on why the backend only ever sees this proxy's fixed
-		// address). Net effect: the second client's "Attempting to
-		// Connect" sat for the full 120s against a relay that had already
-		// been silently killed out from under it - the exact hang the
-		// durability pass was meant to prevent, reintroduced by the
-		// durability pass itself. A quiet host channel is not evidence a
-		// client left the match, especially not during its own handshake
-		// window - don't tear down the pair relay on it. onClientGone and
-		// closeSession are left in place (see matchState) for once a
-		// real, confirmed departure signal exists (see isResignBurst's
-		// own not-yet-confirmed status) - just not wired to fire from
-		// generic session removal until then.
+		name:                "session",
+		cfg:                 cfg,
+		clientConn:          mustListen(cfg.sessionListenAddr),
+		pool:                pool,
+		backendAddrForHost:  func(h *hostCandidate) string { return h.sessionBackendAddr },
+		selectHost:          pool.assignForClient,
+		detectBackendOrigin: true,
+		tracker:             tracker,
+		// History: wiring onSessionRemoved to match.onClientGone broke the
+		// second real client's join outright back on 2026-08-12 -
+		// reproduced live, the client<->host session for whichever client
+		// was mid-handshake could look idle to reapIdleSessions (30s)
+		// while that client was actually busy retrying its P2P handshake
+		// through the just-created pair relay, not sending much toward
+		// the host in that window. That idle reap fired onClientGone,
+		// which tore down the pair relay mid-handshake with nothing to
+		// rebuild it. Left unwired for a long time afterward as a result.
+		//
+		// Re-wired 2026-08-14, safely this time: reapIdleSessions itself
+		// now checks the pair relay's own per-client activity
+		// (pairRelay.idleFor) before ever reaping a session belonging to
+		// an already-paired match - see that function's own doc comment.
+		// A quiet host channel alone no longer reaps a paired session; both
+		// channels have to be genuinely silent first. That's what makes
+		// firing onClientGone here safe again: durability (freeing a
+		// host back up when a real client leaves, so a replacement second
+		// player gets routed there - see hostFull/selectLocked) without
+		// reproducing the original false-positive.
+		onSessionRemoved: func(sess *session) {
+			if sess.host != nil && sess.host.match != nil {
+				sess.host.match.onClientGone(sess.clientAddr)
+			}
+		},
 		rewriteToBackend: func(payload []byte, cfg config, sess *session) []byte {
 			if isResignBurst(payload) {
 				// Logging only, NOT closing the session - see isResignBurst's
@@ -1598,9 +3388,9 @@ func main() {
 			}
 			if isReadyToggle(payload) {
 				ready := readyToggleState(payload)
-				log.Printf("[session] client %s ready-toggle: %v", sess.clientAddr, ready)
-				if match.setReady(sess.clientAddr, ready) && !match.markStarted() {
-					go triggerMatchStart(cfg)
+				log.Printf("[session] client %s (%s) ready-toggle: %v", sess.clientAddr, sess.host.id, ready)
+				if sess.host.match.setReady(sess.clientAddr, ready) && !sess.host.match.markStarted() {
+					go triggerMatchStart(sess.host)
 				}
 			}
 			if !isSessionHandshake(payload) {
@@ -1609,60 +3399,118 @@ func main() {
 				}
 				return payload
 			}
+			// Learn this client's own self-reported sin_zero from its
+			// genuine self block, before it's rewritten below - see
+			// session.selfSinZero's doc comment. Stable for the life of
+			// the session (the client generates it once), so an idempotent
+			// re-set on every handshake packet is harmless.
+			sess.mu.Lock()
+			copy(sess.selfSinZero[:], payload[sessionSelfOffset+8:sessionSelfOffset+16])
+			sess.selfSinZeroKnown = true
+			sess.mu.Unlock()
 			var backendIP [4]byte
-			copy(backendIP[:], sessionBackendUDPAddr.IP.To4())
+			copy(backendIP[:], sess.host.sessionBackendUDPAddr.IP.To4())
 			out := rewriteSessionField(payload, sessionSelfOffset, cfg.publicIP, cfg.publicPort)
-			out = rewriteSessionField(out, sessionPeerOffset, backendIP, uint16(sessionBackendUDPAddr.Port))
+			out = rewriteSessionField(out, sessionPeerOffset, backendIP, uint16(sess.host.sessionBackendUDPAddr.Port))
 			if cfg.verbose {
 				log.Printf("[session] rewriting client-self to %s:%d, peer to backend %s",
-					net.IP(cfg.publicIP[:]), cfg.publicPort, sessionBackendUDPAddr)
+					net.IP(cfg.publicIP[:]), cfg.publicPort, sess.host.sessionBackendUDPAddr)
 				log.Printf("[session] client->backend raw: %s", hex.EncodeToString(payload))
 				log.Printf("[session] client->backend sent: %s", hex.EncodeToString(out))
 			}
 			return out
 		},
 		rewriteToClient: func(payload []byte, cfg config, sess *session) []byte {
-			if isNewPeerBroadcast(payload) {
-				// Polls rather than a one-shot lookup - see
-				// pollOtherSessionClientAddr's doc comment (2026-08-12):
-				// this can legitimately arrive before the other client's
-				// session is registered here yet, and the host does not
-				// reliably retry the broadcast if we just give up on the
-				// first miss. Blocks this client's own backendToClient
-				// read loop for at most otherSessionPollTimeout, which is
-				// fine - this message fires once, not on a hot path.
-				other := sessionProxy.pollOtherSessionClientAddr(sess.clientAddr, otherSessionPollTimeout, otherSessionPollInterval)
-				if other == nil {
-					log.Printf("[session] 0x29 new-peer broadcast to client %s: no other real client session after polling %s, forwarding unmodified", sess.clientAddr, otherSessionPollTimeout)
-					return payload
+			// Skip both broadcast-shape checks below once this client is
+			// already confirmed notified (see pairRelay.notified/
+			// markNotified) - they're only ever meaningful once, at join
+			// time, but without this guard they'd run their length+byte
+			// comparisons against every single backend->client packet for
+			// the rest of a potentially long match. Still runs the checks
+			// whenever relay is nil (pairing hasn't happened yet at all -
+			// exactly when they're expected to fire and create it) or this
+			// client specifically isn't yet marked notified.
+			if pair := sess.host.match.currentPair(); pair == nil || !pair.isNotified(sess.clientAddr) {
+				if isNewPeerBroadcast(payload) {
+					// Polls rather than a one-shot lookup - see
+					// pollOtherSessionClientAddr's doc comment (2026-08-12):
+					// this can legitimately arrive before the other client's
+					// session is registered here yet, and the host does not
+					// reliably retry the broadcast if we just give up on the
+					// first miss. Blocks this client's own backendToClient
+					// read loop for at most otherSessionPollTimeout, which is
+					// fine - this message fires once, not on a hot path.
+					other := sessionProxy.pollOtherSessionClientAddr(sess.clientAddr, sess.host, otherSessionPollTimeout, otherSessionPollInterval)
+					if other == nil {
+						log.Printf("[session] 0x29 new-peer broadcast to client %s (%s): no other real client session on that host after polling %s, forwarding unmodified", sess.clientAddr, sess.host.id, otherSessionPollTimeout)
+						return payload
+					}
+					relay := sess.host.match.ensurePairRelay(sess.clientAddr, other)
+					rewritten := payload
+					// Live-tested 2026-08-20: the host doesn't always have
+					// other's real info filled in yet when it sends this -
+					// an "empty variant" 0x29 (address 0.0.0.0:0, sin_zero
+					// already zeroed) can still arrive AFTER our own
+					// pollOtherSessionClientAddr already finds other's
+					// session (this proxy learns about a client the moment
+					// its own traffic starts flowing, which can outpace the
+					// host's own internal "player added" bookkeeping).
+					// rewriteNewPeerBroadcast correctly overwrites the
+					// address either way, but sin_zero is left as whatever
+					// the host embedded - genuinely other's own real tag in
+					// the normal case, but the empty variant's own zeroed
+					// placeholder otherwise, silently producing a
+					// valid-address/garbage-identity hybrid packet. Always
+					// overwrite with other's own proxy-learned real
+					// sin_zero rather than trusting whatever's already in
+					// the packet, since we have a reliable source for it
+					// either way.
+					if sinZero, ok := sessionProxy.sessionSinZero(other); ok {
+						rewritten = append([]byte(nil), payload...)
+						copy(rewritten[newPeerAddrOffset1+8:newPeerAddrOffset1+16], sinZero[:])
+						copy(rewritten[newPeerAddrOffset2+8:newPeerAddrOffset2+16], sinZero[:])
+					} else {
+						log.Printf("[session] 0x29 new-peer broadcast to client %s: other %s's sin_zero not learned yet, forwarding host's own value unpatched", sess.clientAddr, other)
+					}
+					out := rewriteNewPeerBroadcast(rewritten, cfg.publicIP, relay.selfPort)
+					origIP, origPort := sockaddrInAddr(payload, newPeerAddrOffset1)
+					log.Printf("[session] rewrote 0x29 new-peer broadcast to client %s: %s:%d -> relay %s:%d",
+						sess.clientAddr, origIP, origPort, net.IP(cfg.publicIP[:]), relay.selfPort)
+					return out
 				}
-				relay := match.ensurePairRelay(sess.clientAddr, other)
-				out := rewriteNewPeerBroadcast(payload, cfg.publicIP, relay.selfPort)
-				origIP, origPort := sockaddrInAddr(payload, newPeerAddrOffset1)
-				log.Printf("[session] rewrote 0x29 new-peer broadcast to client %s: %s:%d -> relay %s:%d",
-					sess.clientAddr, origIP, origPort, net.IP(cfg.publicIP[:]), relay.selfPort)
-				return out
-			}
-			if isExistingPeerBroadcast(payload) {
-				// Mirror image of the 0x29 branch above: this client (sess,
-				// the newly-joined one) is being told an *existing* peer's
-				// address - see existingPeerBroadcast's doc comment.
-				// ensurePairRelay/otherSessionClientAddr are already
-				// symmetric in self/other, so whichever of the two
-				// broadcasts arrives first creates the relay and the other
-				// just reuses it. Polls for the same race-survival reason
-				// as the 0x29 branch above.
-				other := sessionProxy.pollOtherSessionClientAddr(sess.clientAddr, otherSessionPollTimeout, otherSessionPollInterval)
-				if other == nil {
-					log.Printf("[session] existing-peer broadcast to client %s: no other real client session after polling %s, forwarding unmodified", sess.clientAddr, otherSessionPollTimeout)
-					return payload
+				if isExistingPeerBroadcast(payload) {
+					// Mirror image of the 0x29 branch above: this client (sess,
+					// the newly-joined one) is being told an *existing* peer's
+					// address - see existingPeerBroadcast's doc comment.
+					// ensurePairRelay/otherSessionClientAddr are already
+					// symmetric in self/other, so whichever of the two
+					// broadcasts arrives first creates the relay and the other
+					// just reuses it. Polls for the same race-survival reason
+					// as the 0x29 branch above.
+					other := sessionProxy.pollOtherSessionClientAddr(sess.clientAddr, sess.host, otherSessionPollTimeout, otherSessionPollInterval)
+					if other == nil {
+						log.Printf("[session] existing-peer broadcast to client %s (%s): no other real client session on that host after polling %s, forwarding unmodified", sess.clientAddr, sess.host.id, otherSessionPollTimeout)
+						return payload
+					}
+					relay := sess.host.match.ensurePairRelay(sess.clientAddr, other)
+					// See the isNewPeerBroadcast branch's own comment above -
+					// same "host's embedded sin_zero can't be trusted, always
+					// overwrite with our own proxy-learned value" fix,
+					// mirrored for this message's own address offsets.
+					rewritten := payload
+					if sinZero, ok := sessionProxy.sessionSinZero(other); ok {
+						rewritten = append([]byte(nil), payload...)
+						copy(rewritten[existingPeerAddrOffset1+8:existingPeerAddrOffset1+16], sinZero[:])
+						copy(rewritten[existingPeerAddrOffset2+8:existingPeerAddrOffset2+16], sinZero[:])
+					} else {
+						log.Printf("[session] existing-peer broadcast to client %s: other %s's sin_zero not learned yet, forwarding host's own value unpatched", sess.clientAddr, other)
+					}
+					out := rewriteExistingPeerBroadcast(rewritten, cfg.publicIP, relay.selfPort)
+					origIP, origPort := sockaddrInAddr(payload, existingPeerAddrOffset1)
+					log.Printf("[session] rewrote existing-peer broadcast to client %s: %s:%d -> relay %s:%d",
+						sess.clientAddr, origIP, origPort, net.IP(cfg.publicIP[:]), relay.selfPort)
+					return out
 				}
-				relay := match.ensurePairRelay(sess.clientAddr, other)
-				out := rewriteExistingPeerBroadcast(payload, cfg.publicIP, relay.selfPort)
-				origIP, origPort := sockaddrInAddr(payload, existingPeerAddrOffset1)
-				log.Printf("[session] rewrote existing-peer broadcast to client %s: %s:%d -> relay %s:%d",
-					sess.clientAddr, origIP, origPort, net.IP(cfg.publicIP[:]), relay.selfPort)
-				return out
 			}
 			if !isSessionHandshake(payload) {
 				if cfg.verbose {
@@ -1684,28 +3532,65 @@ func main() {
 		},
 		sessions: make(map[string]*session),
 	}
-	match.closeSession = sessionProxy.closeSession
-
-	log.Printf("aom-lobby: discovery %s -> %s, session %s -> %s, public address %s:%d",
-		cfg.discoveryListenAddr, cfg.discoveryBackendAddr,
-		cfg.sessionListenAddr, cfg.sessionBackendAddr,
+	// podLister.closeSession and pool.sessionCountForHost can only be
+	// wired up now that sessionProxy exists (same chicken-and-egg reason
+	// match.closeSession used to be set after the fact) - every host
+	// reconcileOnce discovers from here on gets closeSession, and
+	// selectForNewClient's tier classification (empty vs. waiting) starts
+	// working correctly. Then start the discovery loop itself - pool goes
+	// from empty to however many pods match AOM_HEADLESS_LABEL_SELECTOR
+	// within one podPollInterval.
+	podLister.closeSession = sessionProxy.closeSession
+	pool.sessionCountForHost = sessionProxy.sessionCountForHost
+	// See onDiscoveryPingNoHost's own doc comment on *proxy - lets
+	// discoveryProxy kick off sessionProxy's proactive synthesized
+	// host-open as soon as it answers a client's 0x20 ping, rather than
+	// sessionProxy only ever reacting to a client that speaks first.
+	discoveryProxy.onDiscoveryPingNoHost = sessionProxy.beginSimulatedHostOpen
+	go podLister.run(pool)
+	log.Printf("aom-lobby: discovering aom-headless pods (namespace=%s, selector=%s, poll every %s), listening on discovery %s / session %s, public address %s:%d",
+		podLister.namespace, podLister.labelSelector, podPollInterval,
+		cfg.discoveryListenAddr, cfg.sessionListenAddr,
 		net.IP(cfg.publicIP[:]), cfg.publicPort)
-
-	probe := &hostProbe{backendAddr: cfg.discoveryBackendAddr}
-	go probe.run()
 
 	statusMux := http.NewServeMux()
 	statusMux.HandleFunc("/hosts", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "%d\n", probe.count())
+		total := 0
+		for _, h := range pool.snapshot() {
+			total += h.probe.count()
+		}
+		fmt.Fprintf(w, "%d\n", total)
 	})
 	statusMux.HandleFunc("/waiting", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "%t\n", probe.hasWaitingGame())
+		waiting := false
+		for _, h := range pool.snapshot() {
+			if h.probe.hasWaitingGame() {
+				waiting = true
+				break
+			}
+		}
+		fmt.Fprintf(w, "%t\n", waiting)
 	})
 	statusMux.HandleFunc("/full", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "%t\n", match.full())
+		// N-host update: used to mean "does the one match have both real
+		// clients"; now means "is every host in the pool full" - the
+		// meaningful pool-wide signal (no capacity anywhere) now that
+		// there can be more than one match. A single-host pool (today's
+		// only actual deployment) means these are the same question. An
+		// empty pool (no pods discovered yet/at all) reports true - "no
+		// capacity anywhere" is accurate either way, even though the
+		// cause differs from every host being staffed.
+		full := true
+		for _, h := range pool.snapshot() {
+			if !pool.hostFull(h) {
+				full = false
+				break
+			}
+		}
+		fmt.Fprintf(w, "%t\n", full)
 	})
 	go func() {
-		log.Printf("aom-lobby: status endpoint on %s (GET /hosts -> number of hosts waiting for players, GET /waiting -> is there a game with a player waiting, GET /full -> does the match already have both real clients)", cfg.statusListenAddr)
+		log.Printf("aom-lobby: status endpoint on %s (GET /hosts -> number of hosts waiting for players, GET /waiting -> is there a game with a player waiting, GET /full -> is every host in the pool full)", cfg.statusListenAddr)
 		if err := http.ListenAndServe(cfg.statusListenAddr, statusMux); err != nil {
 			log.Fatalf("status server on %q: %v", cfg.statusListenAddr, err)
 		}

@@ -32,4 +32,14 @@ fi
 # debugging aid.
 input-agent &
 
+# auto-host.sh (see that script) - self-hosts this pod into a joinable
+# lobby as part of its own startup, the same "no external trigger needed"
+# reasoning as input-agent above, just for the initial hosting sequence
+# instead of the ready-crystal click. Backgrounded before the exec below
+# for the same reason input-agent is: it needs to survive past this
+# script's own process image being replaced by wine, and it has to start
+# racing against wine's own startup (waiting for the game window) rather
+# than running after it - see the script's own doc comment.
+auto-host.sh &
+
 exec "$@"

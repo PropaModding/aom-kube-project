@@ -4,17 +4,26 @@
 // container's own DISPLAY.
 //
 // It exists because aom-lobby's UI-automation needs split into two
-// different shapes: the startup sequence (EULA through Observer Mode,
-// see host-game-kube.sh) runs once, top-to-bottom, driven from outside
-// the cluster - kubectl exec works fine there. But driving the host's
-// own response to a live event aom-lobby detects mid-session (e.g.
-// isReadyToggle in lobby/main.go seeing both real clients ready) needs
-// aom-lobby, a long-running process with no shell/kubectl access of its
-// own, to trigger a click at the moment it sees that packet. Rather than
-// give aom-lobby kubectl-exec/k8s-API access (a real dependency jump for
-// a UDP proxy), this exposes the one primitive it needs as a plain HTTP
-// call over the normal pod network - see the aom-headless-game Service's
-// input-agent port in k8s/aom-headless-deployment.yaml.
+// different shapes: the startup sequence (EULA through Observer Mode) now
+// runs once, top-to-bottom, entirely inside the pod itself via
+// auto-host.sh (backgrounded by entrypoint.sh right alongside this
+// program - see that script and CLAUDE.md's Key files list; originally
+// driven externally via `kubectl exec host-game-kube.sh` before the
+// 2026-08-13 N-host pass moved it in-container so a scaled-up pod needs
+// no external trigger to self-host). But driving the host's own response
+// to a live event aom-lobby detects mid-session (e.g. isReadyToggle in
+// lobby/main.go seeing both real clients ready) needs aom-lobby, a
+// long-running process, to trigger a click at the moment it sees that
+// packet - and unlike a one-shot startup script, that can't be baked into
+// the pod's own startup ahead of time. Rather than give aom-lobby
+// kubectl-exec access to drive it directly (aom-lobby does have
+// *read-only* Kubernetes API access as of 2026-08-13, to list
+// aom-headless pods for its own host-discovery - see
+// k8s/lobby-rbac.yaml - but that's list/watch on Pods, nothing that can
+// exec into one), this exposes the one primitive aom-lobby needs as a
+// plain HTTP call straight to this pod's own dynamically-discovered
+// podIP:8082 (hostCandidate.inputAgentAddr in lobby/main.go) - no Service
+// involved, same as every other per-host address aom-lobby uses.
 //
 // No auth, cluster-internal only - same posture as aom-lobby's own
 // /hosts, /waiting, /full status endpoints (see lobby-status-api.md).

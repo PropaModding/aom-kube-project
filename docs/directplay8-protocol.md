@@ -59,13 +59,15 @@ All three message types share an embedded `sockaddr_in` (Windows layout,
 02 00                      sin_family = AF_INET (little-endian uint16)
 08 fc                      sin_port   = 2300 (big-endian uint16 = 0x08fc)
 c0 a8 01 67                sin_addr   = 192.168.1.103 (dotted-order bytes)
-18 c0 4e 06 20 c0 4e 06    sin_zero   = NOT actually zero, meaning unknown
+18 c0 4e 06 20 c0 4e 06    sin_zero   = NOT actually zero - see "Open questions" below
 ```
 
 The `sin_family`/`sin_port`/`sin_addr` fields decode cleanly and
 confidently. The 8 bytes where `sin_zero` should be are consistently
-non-zero and vary slightly between messages — flagged as an open question,
-not yet decoded.
+non-zero and vary between messages — **resolved 2026-08-18** (see "Open
+questions" below): a per-participant identity tag the address's own
+owner generates, which must be echoed back exactly by whoever else
+embeds that address, not invented by the embedder.
 
 ### Type 0x25 — discovery query (9 bytes, broadcast)
 
@@ -246,6 +248,43 @@ Every message in this layer shares an 8-byte header:
 Both sides send this type repeatedly and independently — seq and
 connection ID are per-sender, not a shared conversation counter.
 
+**Correction (2026-08-20): byte 1 is not part of a fixed "03 00" type
+marker — it's an independent, frequently-nonzero field, and every message
+detector in `lobby/main.go` (`isNewPeerBroadcast`, `isExistingPeerBroadcast`,
+`isReadyToggle`, `wrapperConnID`, `wrapperSeq`) has been wrongly requiring
+it to be exactly `0x00` since this project's very first working session.**
+This was never a real-time regression - it's a latent bug present in the
+original 2026-08-10/12 implementation, which only ever looked reliable
+because the host retries some messages (e.g. the name-broadcast, per
+`packet-handling-design.md`'s "Case 3" section) and, by chance, at least
+one retry usually landed with byte 1 = `0x00`.
+
+Found via a live node-level packet capture (2026-08-20 P2P pairing
+investigation, see `docs/multi-peer-routing-design.md`'s "Update
+(2026-08-20)" section) that caught a genuine, host-sent `0x29` new-peer
+broadcast arriving at `aom-lobby`'s own socket - confirmed via both the
+raw capture and `aom-lobby`'s own log for the same instant - with byte 1
+= `0x33`, silently falling through `isNewPeerBroadcast`'s check into the
+generic "non-handshake, forward unmodified" path. The exact same shape
+(0x29, byte 1 = `0x02`) was then found already present in the archived,
+confirmed-working 2026-08-12 baseline itself
+(`archiving/sessions/20260812-215320-readyup-resign-quit-test/
+aom-lobby-live.log`, 11:12:52 - logged as "non-handshake", not recognized
+either) - proof this was never specific to today's environment.
+
+**What actually distinguishes byte 1 from seq**: laying out every message
+from one connection ID in that 08-12 session in order shows seq (bytes
+2-3) incrementing perfectly monotonically (`0000, 0001, 0002, 0003,
+0004, ... 000b, 000c, 000d, 000e...`) while byte 1 jumps around
+unrelated to that count (`00, 00, 00, 02, 00, ..., 60, 00, 7b, 49...`) -
+and connection ID (bytes 4-5) stays fixed at that same absolute offset
+regardless of what byte 1 is. Byte 1's actual meaning is still unknown
+(possibly a checksum or unrelated per-message tag) - what's confirmed is
+only that it's unrelated to sequencing and must not gate message-type
+detection. The fix: every detector above should match on byte 0 (`0x03`)
+plus each message's own subtype bytes at their already-confirmed offsets,
+never on byte 1.
+
 ### Player-announce sub-message (93 bytes total this capture)
 
 **Correction (2026-08-11):** the `16 16` pair below isn't a constant part
@@ -300,7 +339,7 @@ match ("Random" per the host's own in-lobby map selector at the time of
 capture). Same packet also repeats the session name (`"host's Game"`,
 UTF-16LE, matching the 0x26 discovery reply's field) later in the payload.
 
-### Type 0x03 sub-type with a constant string ("paullovesjade")
+### Type 0x03 sub-type with a constant string ("paullovesjade") - CD-key-check field, NOT a player name
 
 ```
 03 00 <seq> <conn-id> 0e 00
@@ -310,20 +349,41 @@ UTF-16LE, matching the 0x26 discovery reply's field) later in the payload.
 
 The length prefix (`0e 00` = 14) exactly matches
 `len("paullovesjade\0")`, so the decode is solid — and notably **ASCII,
-not UTF-16LE** like every other string field in this protocol.
+not UTF-16LE** like every other string field in this protocol (the real
+player-nickname field, the separate player-announce sub-message, is
+UTF-16LE - see below). **This is not a name field of any kind - do not
+read it as one.**
 
-**Correction:** originally flagged as possibly tied to a patched-out
-CD-key/version check, since it fired constantly and didn't match either
-side's real nickname (`TheIP` in that test). That hypothesis is now
-disproven: this exact same string, byte-for-byte, appears in the
-`run-aom-verbose-clients.sh` capture too — a connection that genuinely
-succeeded. A CD-key rejection couldn't produce a working connection, so
-whatever this is, it isn't gating anything. It's constant across sessions
-and unrelated to either player's real nickname (confirmed above), so the
-most likely explanation is still that it's baked into `aomxnocd1.exe`
-itself — plausibly a signature left by whoever built the No-CD crack,
-sitting in a reused buffer rather than being genuinely player-supplied.
-Harmless artifact, not a protocol requirement — nothing to replicate.
+**Corrected again 2026-08-19, this time with a live test proving it's
+functionally required, not cosmetic.** Every real capture (host, joiner,
+accepted or rejected sessions alike) sends this exact string, byte-for-
+byte, every time - it's a fixed value baked into `aomxnocd1.exe` itself,
+plausibly a leftover CD-key-check salt/placeholder from whoever built
+this No-CD crack, sent in place of whatever a real, uncracked client
+would derive from an actual CD key. `aom-lobby`'s own synthesis
+(`lobby/main.go`) originally sent a different placeholder value here
+(`"TheIP"`, back when this field was still assumed to be a real
+nickname slot) - **that was a real, confirmed bug**: a real client would
+receive the host's opening exchange correctly but then simply never send
+its own name-broadcast back, stalling indefinitely until its own ~2-
+minute patience timeout. Changing the synthesized value to
+`"paullovesjade"` (matching every real capture exactly) fixed this
+immediately, live-tested and confirmed 2026-08-19 - the client now
+replies with its own name-broadcast right away, exactly like a real
+host/joiner exchange, and the rest of the "lobby full" sequence proceeds
+normally from there.
+
+This directly overturns the previous correction on this page ("harmless
+artifact... nothing to replicate") - the exact string content clearly
+matters to the receiving client in some way, even though the mechanism
+isn't confirmed. What's still solid from before: no variation has ever
+been observed in this field across any capture this project has taken,
+including the one genuinely successful, non-rejected 3-peer match - so
+whatever check the client performs against it (if any), it's a fixed
+comparison against this one constant, not a live cryptographic exchange
+with any per-session nonce or variation. **For spoofing purposes: send
+exactly `"paullovesjade"`, nothing else - this is now a load-bearing
+field, not a cosmetic one.**
 
 ### Type 0x07ff (10 bytes)
 
@@ -666,20 +726,38 @@ broadcast directly from the host or relayed peer-to-peer from an existing
 client is unconfirmed and, given the 1v1-only scope, not expected to
 matter.
 
-**Not yet captured**: what happens on this channel when one player drops
-mid-match and a new player joins the vacated slot - relevant to
-`aom-lobby`'s planned per-pair relay design needing correct teardown/
-reuse semantics (see the design doc this finding feeds into, once
-written).
+**Partially captured since**: the *same* client dropping and rejoining
+(idle-timeout teardown, then a clean re-pair) is now confirmed working
+live, twice - 2026-08-12 (ad-hoc, `lobby/packet-handling-design.md`'s
+Durability section) and again 2026-08-14/15
+(`docs/multi-peer-routing-design.md`'s durability discussion). **Still
+not captured**: a genuinely *different* replacement client (different
+real address) taking the vacated slot - unconfirmed whether the host
+re-announces for that harder case the same way it does for a same-client
+rejoin.
 
 ## Open questions
 
-- What are the 8 non-zero `sin_zero` bytes? Possibly a sequence number,
-  session token, or uninitialized memory from Wine's `dpnet`
-  implementation (worth checking Wine source/debug logs for). Note: in
-  the 2026-08-03 capture the same exact 8 bytes appeared for *both* the
-  host's and client's `sockaddr_in` within one session, which fits
-  "uninitialized/reused buffer" better than "per-address token."
+- ~~What are the 8 non-zero `sin_zero` bytes?~~ **Resolved 2026-08-18**
+  (`archiving/sessions/20260818-*-directconnect-only-capture/NOTES.md`,
+  `lobby/packet-handling-design.md`'s "Next investigation" section): a
+  per-participant identity tag each side generates once to describe
+  itself, which whoever else embeds that participant's address later
+  MUST echo back exactly - not a fixed pattern, not uninitialized
+  memory, not something the embedding side invents. Confirmed with an
+  exact 8-byte match between a joiner's own self-reported `sin_zero` in
+  its `0x20` ping and what the host later echoed back describing that
+  same joiner as "peer" in its own `0x00` message. The 2026-08-03
+  capture's "same 8 bytes for both host and client" observation that
+  originally suggested "uninitialized/reused buffer" was, in hindsight,
+  just host and joiner's independently-generated tags happening to
+  coincide in that one session - two later captures (2026-08-15,
+  2026-08-17) showed the same coincidental match, and only the
+  2026-08-18 Direct-Connect capture happened to have genuinely different
+  host/joiner tags, which is what exposed the real echo pattern.
+  `synthesizedSockaddr` in `lobby/main.go` was corrected the same day to
+  echo a learned client `sin_zero` instead of using one fixed pattern
+  for every sockaddr block regardless of whose address it describes.
 - What's inside the 0x26 header's `00 00` (bytes 2-3, before the trailing
   `00` at byte 4) — likely a version or reserved field, unconfirmed.
 - Full structure of the UDP 2300 session/sequence-numbering layer (see

@@ -1,12 +1,27 @@
 # aom-lobby: the fake DirectPlay8 lobby. Sits on the node's real UDP
 # 2299 *and* 2300 (hostNetwork, same justification aom-headless used to
 # have: AoM's Direct-IP field has no port entry, so these fixed ports
-# can't be remapped behind a NodePort). Relays both to the real game pod
-# via aom-headless-game, rewriting embedded addresses so the pod never
-# sees a client's real address and vice versa - discovery/ping replies on
-# 2299, and the 2300 session handshake's leaked "self" address (see
-# lobby/main.go and docs/directplay8-protocol.md for why 2300 needs this
-# too, not just 2299).
+# can't be remapped behind a NodePort).
+#
+# N-host update (2026-08-13): relays to however many aom-headless pods
+# are currently running (`kubectl scale deployment/aom-headless
+# --replicas=N`), discovered dynamically via the Kubernetes API
+# (lobby/main.go's podLister) rather than a fixed aom-headless-game
+# Service address - that Service no longer exists (see
+# k8s/aom-headless-deployment.yaml's own comment on why a shared
+# ClusterIP doesn't work once there's more than one pod). Rewrites
+# embedded addresses per-backend so no pod ever sees a client's real
+# address and vice versa - discovery/ping replies on 2299, and the 2300
+# session handshake's leaked "self" address (see lobby/main.go and
+# docs/directplay8-protocol.md for why 2300 needs this too, not just
+# 2299).
+#
+# serviceAccountName below grants exactly the read-only pod list/watch
+# access podLister needs (see k8s/lobby-rbac.yaml) - nothing that can
+# create/delete/exec a pod. AOM_HEADLESS_NAMESPACE/
+# AOM_HEADLESS_LABEL_SELECTOR (both left at their defaults here -
+# "default"/"app=aom-headless", matching aom-headless-deployment.yaml's
+# own label) control which pods it looks for.
 #
 # PUBLIC_ADDR isn't known until the cluster exists (it's the minikube
 # node's own IP) — deploy-minikube.sh patches it in after apply.
@@ -41,6 +56,7 @@ spec:
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: aom-lobby
       containers:
         - name: aom-lobby
           image: aom-lobby:latest
@@ -58,12 +74,8 @@ spec:
           env:
             - name: LISTEN_ADDR
               value: ":2299"
-            - name: AOM_BACKEND_ADDR
-              value: "aom-headless-game:2299"
             - name: SESSION_LISTEN_ADDR
               value: ":2300"
-            - name: SESSION_BACKEND_ADDR
-              value: "aom-headless-game:2300"
             - name: PUBLIC_ADDR
               value: "127.0.0.1" # placeholder, patched to `minikube ip` by deploy-minikube.sh
           resources:

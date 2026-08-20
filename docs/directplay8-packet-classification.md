@@ -82,6 +82,22 @@ carries every existing peer's address, not just the host's).
 
 ### What this means for `aom-lobby` — an unexamined gap
 
+**Resolved, same day (2026-08-10) - see `docs/directplay8-protocol.md`'s
+"Correction (2026-08-10)" note**: the gap this section describes (and
+Row 8/Row 10 below) turned out to be real, but already found and fixed
+independently before this section's own "next capture" ever happened.
+The message that tells B about A's address is the 87-byte
+`existingPeerBroadcast` (not part of B's session-handshake reply as
+hypothesized here, but its own distinct settings-sync sub-message) -
+implemented as `isExistingPeerBroadcast`/`rewriteExistingPeerBroadcast`
+in `lobby/main.go`. And Row 10 (B's own outbound peer-connect attempt)
+was directly observed and decoded 2026-08-14/15, via `pairRelay.run()`'s
+verbose payload logging - see `docs/multi-peer-routing-design.md`'s
+"Regression investigation (2026-08-14)" section for the captured bytes.
+Left the rest of this section as-is below as the reasoning record that
+led to finding it, not rewritten after the fact - same convention this
+project's docs use elsewhere.
+
 If this mapping holds even loosely: **we have only ever rewritten the
 `0x29`-equivalent message (host→A, telling A about B). We have never
 rewritten whatever earlier message tells B about A's address** — which,
@@ -117,11 +133,10 @@ client.
 | 5 | B | Lobby | 2299 | B's discovery query | Yes |
 | 6 | B | Lobby | 2300 | B's session handshake, same rewrite as #3/4 | Yes |
 | 7 | Host→Lobby→A | — | 2300 | `0x29` new-peer broadcast, Lobby rewrites embedded addr → dedicated pair-relay port (`PUBLIC_IP:P3`) | Yes (2026-08-10 fix) |
-| 8 | **Host→Lobby→B** | — | 2300 | **Unconfirmed/unexamined**: whatever message tells B about A's address (hypothesized: part of B's own `DN_SEND_CONNECT_INFO`-equivalent reply, i.e. B's *own* session handshake/name-table reply from the host) — **not currently rewritten at all** | **No — this is the gap** |
+| 8 | Host→Lobby→B | — | 2300 | `existingPeerBroadcast` (87 bytes, distinct message from `0x29`, not part of B's session-handshake reply as hypothesized) - tells B about A's address, Lobby rewrites embedded addr → pair-relay port | **Yes (resolved 2026-08-10)** |
 | 9 | A | Lobby:P3 | P3 (dynamic) | A's outbound peer-connect attempt, relayed to B's real addr | Yes, delivered correctly (tcpdump-confirmed) |
-| 10 | **B** | **?** | **?** | **B's own outbound peer-connect attempt toward A** — never observed in any capture so far. Per the DP8 sequence, this should exist and fire independently of #9, not merely as a reply to it. | **No — not seen at all, in either direction, in any capture yet** |
+| 10 | B | Lobby:P3 | P3 (dynamic) | B's own outbound peer-connect attempt toward A, relayed to A's real addr - same relay, opposite direction from #9 | **Yes (confirmed 2026-08-14/15, decoded via verbose relay logging)** |
 
-Row 10 is the single biggest open question. Every capture so far has
-looked for B's *reply* to A's traffic; none has specifically looked for
-B's *own independent outbound attempt* toward whatever address B
-believes A is at. That's what the next capture needs to isolate.
+Both rows above were this doc's two biggest open questions at the time
+of writing and are now resolved - see the "Resolved, same day" note in
+the previous section for where each finding actually landed.

@@ -8,8 +8,13 @@ see below). Driven from the host machine with
 `kubectl port-forward`'d VNC session, since it can both capture screenshots
 and send input over the wire — no in-container screenshot tool needed.
 
+No shared VNC Service anymore (2026-08-13's N-host change - see
+`k8s/aom-headless-deployment.yaml`'s own comment on why a ClusterIP
+can't speak for more than one pod): port-forward the specific pod you
+want, found via `kubectl get pods -l app=aom-headless`.
+
 ```
-kubectl port-forward svc/aom-headless-vnc 5901:5900 &
+kubectl port-forward pod/<name> 5901:5900 &
 vncdotool -s localhost::5901 capture screenshot.png
 vncdotool -s localhost::5901 move <x> <y> click 1
 vncdotool -s localhost::5901 type "SomeText"
@@ -22,11 +27,13 @@ into `dockerfile.k8s`/`user.cfg`), which is exactly what `vncdotool`'s
 800x600, nothing else is on that display) — no offset math needed, unlike
 `xdotool --window` which needs window-relative coordinates.
 
-**To watch `host-game-kube.sh` drive the pod live** (useful whenever
-tuning its click/key sequence): in one terminal,
-`kubectl port-forward svc/aom-headless-vnc 5901:5900`, then from your
-desktop `remmina -c vnc://localhost:5901` — connects straight in over
-VNC, no password, no need to click through Remmina's New Connection
+**To watch `host-game-kube.sh` (or `auto-host.sh`, its in-container
+sibling that self-hosts every pod on startup as of 2026-08-13 - see this
+repo's `CLAUDE.md`) drive the pod live** (useful whenever tuning the
+click/key sequence): in one terminal, `kubectl port-forward pod/<name>
+5901:5900` (name from `kubectl get pods -l app=aom-headless`), then from
+your desktop `remmina -c vnc://localhost:5901` — connects straight in
+over VNC, no password, no need to click through Remmina's New Connection
 dialog first.
 
 **Why not `host-game.sh`'s xdotool/scrot approach, for calibration**: that
@@ -243,14 +250,14 @@ was caught watching live over VNC.)
 
 ## Still to do
 
-- Match-start isn't automated - out of scope for the current
-  DPNID-capture goal, which only needs players *joined*, not a match in
-  progress. See `docs/directplay8-protocol.md`'s "Ready-toggle
-  sub-message" section and `docs/multi-peer-routing-design.md`'s
-  "Next steps" item 3 for the packet-detection half of this (done); what's
-  still missing is `aom-lobby` actually being able to command the pod
-  (e.g. `kubectl exec ... xdotool`) once it knows both real clients are
-  ready.
+- ~~Match-start isn't automated~~ - **done 2026-08-11**, end to end. See
+  `docs/multi-peer-routing-design.md`'s "Next steps" item 3: `input-agent`
+  (a small HTTP server baked into `dockerfile.k8s`, running alongside
+  Xvfb/wine) exposes `POST /click?x=&y=`, and `aom-lobby`'s
+  `matchState.setReady()`/`markStarted()`/`triggerMatchStart()` POST to it
+  exactly once both real clients flip ready - clicking the host's own
+  Ready crystal at (511, 89), confirmed live to start the match with no
+  separate "Start Game" button involved.
 - Game name/map/settings are currently left at their defaults
   (`Supremacy`, `Random` map, `Normal` size, `Easy` difficulty) — revisit
   if a capture needs specific settings.

@@ -1,0 +1,33 @@
+# Grants aom-lobby exactly what its podLister needs (lobby/main.go) to
+# discover aom-headless backends dynamically: get/list/watch on Pods,
+# nothing else. No create/update/delete/exec on anything - this proxy
+# never acts on a pod, only reads its IP/phase (driving a pod's own
+# clicks is input-agent's job, called over plain HTTP, not the k8s API -
+# see CLAUDE.md). Namespaced (Role, not ClusterRole): this project has
+# never used more than the `default` namespace, confirmed across every
+# other manifest here.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: aom-lobby
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: aom-lobby-pod-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: aom-lobby-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: aom-lobby
+roleRef:
+  kind: Role
+  name: aom-lobby-pod-reader
+  apiGroup: rbac.authorization.k8s.io
