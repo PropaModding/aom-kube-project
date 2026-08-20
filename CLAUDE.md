@@ -1,5 +1,18 @@
 # AoM Kube Project
 
+## Current top priority (2026-08-20)
+**`lobby/session-cleanup-design.md`** - session/host lifecycle cleanup.
+The P2P pairing mystery is resolved (see `docs/multi-peer-routing-design.md`'s
+"Update (2026-08-20)" section and `docs/directplay8-protocol.md`'s "Common
+wrapper" correction), but fixing it live surfaced a real, reproduced bug
+in the N-host pool's own cleanup story: a client stuck sticky-bound to a
+host pod that no longer existed, with no in-process recovery short of
+restarting `aom-lobby`. That doc covers four related gaps found tracing
+the same area (`hostPool.assigned` never revalidated, a removed host's
+`pairRelay`/`hostProbe` goroutines never torn down, its sessions never
+proactively closed) and the fix plan for all four. Read that first if
+picking this project up.
+
 ## What this is
 Kubernetes/Docker setup to modernise Age of Mythology (original) network hosting,
 spoofing DirectPlay 8 packets to support modern multiplayer hosting environments.
@@ -22,9 +35,10 @@ spoofing DirectPlay 8 packets to support modern multiplayer hosting environments
 - `docs/directplay8-protocol.md` — reverse-engineered wire protocol findings
 - `docs/lobby-status-api.md` — `aom-lobby`'s `GET /hosts`/`GET /waiting`/`GET /full` status endpoints
 - `docs/host-flow.md` — driving `aom-headless` from cold pod to hosted lobby via `xdotool`/VNC calibration
-- `docs/multi-peer-routing-design.md` — design + implementation notes for routing a full 1v1 match (not just client↔host, implemented 2026-08-10) and for N-host round-robin matchmaking (implemented 2026-08-13) — see Architecture intention below; also has a 2026-08-14 regression investigation + fix (a second real client intermittently never getting told about the first, `aom-lobby`'s new-peer-broadcast watchdog)
+- `docs/multi-peer-routing-design.md` — design + implementation notes for routing a full 1v1 match (not just client↔host, implemented 2026-08-10) and for N-host round-robin matchmaking (implemented 2026-08-13) — see Architecture intention below. Also has the full 2026-08-14→2026-08-20 investigation into a second real client intermittently never getting told about the first: **resolved 2026-08-20** — several packet detectors wrongly required the settings-sync wrapper's byte 1 to be `0x00`, a byte that was never actually constant, silently dropping genuine broadcasts whenever it wasn't (see docs/directplay8-protocol.md's "Common wrapper" correction). Not a host reliability issue and not a network bypass, despite both being seriously suspected along the way - the host was sending everything correctly the whole time. The same-session watchdog-synthesis workaround this investigation built (`startNewPeerWatchdog`) is removed as unnecessary now that detection is fixed.
 - `docs/directplay8-packet-classification.md` — classification reference cross-checking our reverse-engineered packets against the official DirectPlay 8 Open Specifications, plus a list of confirmed vs. still-open message types for the next capture
-- `lobby/packet-handling-design.md` — **"Next investigation" section**: the no-eligible-host synthesis mystery this section used to describe (client never sends its own name-broadcast against `aom-lobby`'s synthesized host) **is resolved as of 2026-08-19** — root cause was the synthesized name-broadcast's content (`"TheIP"` instead of `"paullovesjade"`, the CD-key-check field, not a nickname — see `simulatedFullLobbyCrackSignature`'s doc comment in `lobby/main.go`); a real client now completes the full sequence (open, ack, name-broadcast exchange, rejection, resign) exactly like a real host's. **A different, genuinely open mystery replaces it**: the real client<->client P2P pairing path (`pairRelay`, used once a real `aom-headless` backend exists and two real clients are matched to it) — two real clients correctly learn each other's relay address and both send their own peer-open, but neither ever acks the other's, confirmed against 7,000+ packets over ~8 minutes with zero acks either direction. Content, delivery, and LAN-isolation config all confirmed correct; the gap is specifically that a byte-perfect received packet doesn't get acted on client-side, which needs client-side instrumentation to go further. Full writeup: `docs/multi-peer-routing-design.md`'s "Update (2026-08-19)" section. **Correction to an earlier claim**: this doc previously said the real backend-routing path was "confirmed working end-to-end, including full real matches" — that was true under the architecture as of the last actual commit (2026-08-12, single static host, no LAN isolation); the N-host pool + LAN-sanitization work built since then (2026-08-13/14) is entirely uncommitted, and under *that* environment, two real clients pairing has not been re-confirmed to complete — see the P2P mystery above
+- `lobby/packet-handling-design.md` — packet reference + durability design, companion to `main.go`. The no-eligible-host synthesis mystery and the P2P pairing mystery it once tracked are both resolved (see the `multi-peer-routing-design.md` entry above) - this doc's own packet-reference table has the byte-1 correction noted against every entry it affected.
+- `lobby/session-cleanup-design.md` — **current top priority, see above** — session/host lifecycle cleanup design, four related gaps found live 2026-08-20 tracing the bug that stuck a client on a deleted host pod forever (`hostPool.assigned` never revalidated, a removed host's `pairRelay`/`hostProbe` goroutines never torn down, its sessions never proactively closed).
 - `host-game-kube.sh` — the original hosting automation (EULA → menus → lobby, Players set to 3), driven externally via `kubectl exec`; superseded for routine use by `auto-host.sh` above, kept for manual/debug re-runs against a specific pod
 - `run-aom-spoofed-client.sh` — one "second PC" container for testing Direct-Connect against the cluster
 - `run-aom-verbose-clients.sh` — two spoofed clients (host + 1 joiner) joining directly (no lobby/proxy), with full WINEDEBUG + in-container tcpdump byte capture, for diffing a genuinely successful connection against a failing proxied one
@@ -169,17 +183,22 @@ each concurrent match (one per `aom-headless` pod) gets its own
 independent relay/pairing, not just one global one — see "Architecture
 intention" above.
 
-**Currently regressed, open as of 2026-08-19**: two real clients matched
-on the same real host correctly learn each other's relay address (both
-directions confirmed byte-perfect) but the peer-to-peer handshake
-between them never completes an ack, indefinitely — see
-`docs/multi-peer-routing-design.md`'s "Update (2026-08-19)" section for
-the full investigation. Not a regression in this mechanism's own code
-(confirmed byte-for-byte unchanged since the commit that first proved it
-working) — the N-host pool and LAN-sanitization layers built since then
-(2026-08-13/14) are both still entirely uncommitted, and the 2026-08-10
-baseline's success may have depended partly on a direct-reachability
-bypass those layers correctly closed.
+**Resolved 2026-08-20** (was open as of 2026-08-19): two real clients
+matched on the same real host correctly learned each other's relay
+address but the peer-to-peer handshake between them never completed an
+ack. Root cause found via a node-level packet capture: several packet
+detectors (`isNewPeerBroadcast`, `isExistingPeerBroadcast`,
+`isReadyToggle`, `wrapperConnID`, `wrapperSeq`) wrongly required the
+settings-sync wrapper's byte 1 to be exactly `0x00` - not a real
+constant, so genuine broadcasts were silently dropped whenever it wasn't.
+A latent bug present since this project's first working session, not a
+regression and not a host reliability issue - see
+`docs/directplay8-protocol.md`'s "Common wrapper" correction and
+`docs/multi-peer-routing-design.md`'s "Update (2026-08-20)" section for
+the full trail. Fixing it live surfaced a second, unrelated issue in the
+N-host pool's own host-removal cleanup - see
+`lobby/session-cleanup-design.md`, the current top priority (top of this
+file).
 
 ### Dual client-variant support (retail DirectPlay + Voobly)
 
