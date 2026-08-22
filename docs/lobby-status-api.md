@@ -97,11 +97,14 @@ already waiting for a second player, then an empty host, then
 ineligible - "fill an open match before starting a new one," round-robin
 within whichever tier has candidates. Sticky per real client IP for the
 life of that client's connection either way (see that method's own doc
-comment). **Not built yet**: the claim/reservation race guard for two
-clients connecting within the same few seconds, and a spoofed "lobby
-full" rejection when no host is eligible (still blocked on a reference
-capture that's never been taken - a full pool today just silently drops
-a turned-away client's query).
+comment - **known gap**: not currently revalidated if the assigned host
+is later removed from the pool, see `lobby/session-cleanup-design.md`).
+Corrected 2026-08-22, this paragraph was stale: the claim/reservation
+race guard turned out to be unnecessary (resolved by construction, see
+`lobby/packet-handling-design.md`'s "The race this needs to guard
+against"), and the spoofed "lobby full" rejection for when no host is
+eligible **is implemented** - see that same doc's "Case 3 in detail"
+section.
 
 ## Config
 

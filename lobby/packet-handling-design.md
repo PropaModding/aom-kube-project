@@ -539,11 +539,11 @@ Full writeup of what shipped and why: `docs/multi-peer-routing-design.md`'s
 "N-host round-robin matchmaking (2026-08-13)" section. The
 claim/reservation mechanism this section originally called for turned
 out to be unnecessary - **resolved by construction, see "The race this
-needs to guard against" below for why**. **Still NOT implemented**: case
-3's `synthesizeLobbyFullRejection` (still blocked on a reference capture
-of a genuine DirectPlay rejection that's never been taken - a full pool
-today just silently drops a turned-away client's query, same as an empty
-pool always has).
+needs to guard against" below for why**. Case 3's
+`synthesizeLobbyFullRejection` - stale note corrected 2026-08-22: this
+paragraph is from before the fact and was never updated - see "Case 3 in
+detail" below for the real status (implemented 2026-08-15, promoted to
+always-on production behavior 2026-08-18).
 
 Everything above assumes a single match (one `aom-headless` backend, one
 pair relay). This section is the other half of CLAUDE.md's Architecture
