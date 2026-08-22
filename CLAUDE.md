@@ -76,6 +76,11 @@ spoofing DirectPlay 8 packets to support modern multiplayer hosting environments
   Voobly itself). These need their own protocol capture/reverse-
   engineering pass — don't assume `aom-lobby`'s current DirectPlay
   rewrite logic (`lobby/main.go`) covers Voobly traffic at all.
+  **Deprioritized 2026-08-22**: a real goal, but low priority — no
+  capture exists, nothing else in this project depends on it, and
+  everything confirmed working so far (N-host matchmaking, P2P pairing,
+  lobby-full synthesis) is retail/No-CD only. Don't pick this up before
+  the higher-priority items at the top of this file.
 
 ## Architecture intention
 
@@ -202,10 +207,12 @@ file).
 
 ### Dual client-variant support (retail DirectPlay + Voobly)
 
-Two distinct AoM client variants need to work, and they don't speak the
+**Low priority as of 2026-08-22** — see the Goals section above. Two
+distinct AoM client variants need to work, and they don't speak the
 same protocol — `aom-lobby` will eventually need to classify incoming
 traffic and run two separate handling pipelines, not just one rewrite
-path.
+path. Nothing here is blocking; revisit after the higher-priority items
+at the top of this file.
 
 **What's confirmed about the retail/No-CD client** (`aomxnocd1.exe`,
 which is what every capture and protocol doc in this repo so far
