@@ -24,17 +24,27 @@ broken until someone notices and manually deletes it. Hit twice in one
 session under concurrent load (3 client containers + 2 host pods on one
 dev machine, matching the exact CPU-contention/dropped-keystroke risk
 this project's own docs already flag for `xdotool` under
-`llvmpipe`-software-rendered load). **Proposed fix, not yet designed in
-detail**: a Kubernetes liveness or readiness probe on the `aom-headless`
-deployment that actually verifies the hosted state (not just "auto-host.sh
-exited 0") and lets Kubernetes' own restart-on-failed-probe behavior
-retry automatically instead of silently leaving a broken pod in place.
-Needs a real signal to probe - candidates: extend `input-agent` with a
-`/healthz`-style endpoint that either checks for a completion marker
-`auto-host.sh` writes only after confirming (not just clicking through)
-success, or has `input-agent` itself fire the same `0x25`/`0x26`
-discovery-port check `aom-lobby`'s own `hostProbe` already does, from
-inside the pod.
+`llvmpipe`-software-rendered load). Real routing safety already exists
+for this (`hostPool.selectLocked` already excludes a stuck pod from ever
+being assigned a client via `hostLive`) - what's actually missing is
+detection and recovery, so the pod doesn't just sit there wasting
+capacity forever.
+
+**Designed 2026-08-22, not yet implemented**: `docs/host-health-probe-design.md`
+- a new `host-health-agent` `DaemonSet` (one per node, not baked into
+every `aom-headless` pod) that fires the same `0x25`/`0x26`
+discovery-port check `aom-lobby`'s own `hostProbe` already does against
+every `aom-headless` pod on its own node, exposing the result over a
+small status endpoint that each pod's own k8s `livenessProbe.exec`
+calls into (failing open on anything but an explicit "not hosting", so
+a health-agent hiccup can't mass-restart the whole pool). Includes full
+packet-byte evidence that the discovery exchange is client-initiated
+(the host never broadcasts spontaneously - confirmed against two
+historical captures) and a needed correction: this same file's own LAN-
+sanitization section describes `k8s/aom-headless-netpol.yaml` as locking
+egress to "just aom-lobby's address + DNS" - the actual rule is looser
+(denies only the docker-bridge client subnet, allows everything else),
+which is why the new `DaemonSet` needs no `NetworkPolicy` change at all.
 
 ## What this is
 Kubernetes/Docker setup to modernise Age of Mythology (original) network hosting,
@@ -61,7 +71,8 @@ spoofing DirectPlay 8 packets to support modern multiplayer hosting environments
 - `docs/multi-peer-routing-design.md` — design + implementation notes for routing a full 1v1 match (not just client↔host, implemented 2026-08-10) and for N-host round-robin matchmaking (implemented 2026-08-13) — see Architecture intention below. Also has the full 2026-08-14→2026-08-20 investigation into a second real client intermittently never getting told about the first: **resolved 2026-08-20** — several packet detectors wrongly required the settings-sync wrapper's byte 1 to be `0x00`, a byte that was never actually constant, silently dropping genuine broadcasts whenever it wasn't (see docs/directplay8-protocol.md's "Common wrapper" correction). Not a host reliability issue and not a network bypass, despite both being seriously suspected along the way - the host was sending everything correctly the whole time. The same-session watchdog-synthesis workaround this investigation built (`startNewPeerWatchdog`) is removed as unnecessary now that detection is fixed.
 - `docs/directplay8-packet-classification.md` — classification reference cross-checking our reverse-engineered packets against the official DirectPlay 8 Open Specifications, plus a list of confirmed vs. still-open message types for the next capture
 - `lobby/packet-handling-design.md` — packet reference + durability design, companion to `main.go`. The no-eligible-host synthesis mystery and the P2P pairing mystery it once tracked are both resolved (see the `multi-peer-routing-design.md` entry above) - this doc's own packet-reference table has the byte-1 correction noted against every entry it affected.
-- `lobby/session-cleanup-design.md` — **current top priority, see above** — session/host lifecycle cleanup design, four related gaps found live 2026-08-20 tracing the bug that stuck a client on a deleted host pod forever (`hostPool.assigned` never revalidated, a removed host's `pairRelay`/`hostProbe` goroutines never torn down, its sessions never proactively closed).
+- `lobby/session-cleanup-design.md` — session/host lifecycle cleanup design, four related gaps found live 2026-08-20 tracing the bug that stuck a client on a deleted host pod forever (`hostPool.assigned` never revalidated, a removed host's `pairRelay`/`hostProbe` goroutines never torn down, its sessions never proactively closed). Phases 1-3 implemented and live-verified 2026-08-22.
+- `docs/host-health-probe-design.md` — **current top priority, see above** — design for a `host-health-agent` `DaemonSet` that detects a silently-stuck `auto-host.sh` run and lets Kubernetes restart it automatically, plus the packet-level evidence that the discovery exchange is client-initiated (no spontaneous host broadcast to passively observe).
 - `host-game-kube.sh` — the original hosting automation (EULA → menus → lobby, Players set to 3), driven externally via `kubectl exec`; superseded for routine use by `auto-host.sh` above, kept for manual/debug re-runs against a specific pod
 - `run-aom-spoofed-client.sh` — one "second PC" container for testing Direct-Connect against the cluster
 - `run-aom-verbose-clients.sh` — two spoofed clients (host + 1 joiner) joining directly (no lobby/proxy), with full WINEDEBUG + in-container tcpdump byte capture, for diffing a genuinely successful connection against a failing proxied one
