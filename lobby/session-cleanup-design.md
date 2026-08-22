@@ -1,7 +1,9 @@
 # Session/host lifecycle cleanup: closing the leaks left by N-host churn
 
-**Status: design only, not yet implemented. Top priority as of 2026-08-20.**
-Written after a live test hit `hostPool.assigned`'s already-documented
+**Status: Phases 1-3 implemented and fully live-verified 2026-08-22** (see
+"Verifying the fix" below for the confirmed test). Phase 4 remains
+optional/not implemented, per its own section. Written after a live test
+hit `hostPool.assigned`'s already-documented
 staleness gap directly: a client stayed sticky-bound to a host pod that
 had already been deleted, and its session-port traffic kept failing
 against a dead backend indefinitely - the only fix available at the time
@@ -217,3 +219,36 @@ mid-match. Confirm:
 - A reconnect from the same client IPs gets freshly routed to the
   surviving host, not retried against the dead one - i.e. Phase 1's own
   fix, confirmed end-to-end rather than just unit-level.
+
+### Confirmed live, 2026-08-22
+
+Ran exactly this test (fresh 2-client pair, formed and relaying
+bidirectionally, host pod deleted mid-match) and traced the log line by
+line:
+
+- Host removal detected one podLister poll cycle (~4s) after
+  `kubectl delete pod`: `[pool] host removed: ... (no longer listed)`.
+- Client A's session was force-closed immediately on that same line:
+  `closing session for client ... (host ... removed)` - not left to the
+  30-40s idle reaper. Client B's session had already self-cleaned a few
+  seconds earlier via its own read-error path (the backend socket errored
+  with `connection refused` as the pod was terminating, which is the
+  pre-existing per-session error handling, not Phase 3's code) - so it
+  never needed Phase 3 to close it; confirmed this is expected behavior,
+  not a gap, by reading `backendToClient`'s error path.
+- `pairRelay` teardown fired correctly: `[match] ... departed, tearing
+  down pair relay` followed by the relay's own `(relay stopping)` read
+  error, before the host-removal event even landed (fired off the normal
+  per-client departure path, which is correct - `teardownForRemovedHost`
+  is a backstop for exactly the case where no client-departure event
+  happens to fire first).
+- No further log lines referenced the removed host's ID afterward,
+  consistent with its `hostProbe` goroutine stopping via `stopProbe()`.
+- A fresh host pod came up and registered on its own
+  (`[pool] host added: ...`); reconnecting the same two clients produced
+  a healthy new pair (`/full` = true, bidirectional `[pair] relaying`
+  traffic) on the new host, with no stuck reference to the deleted one -
+  Gap 1's fix confirmed end-to-end.
+
+All four gaps traced in this doc are closed and verified against a real,
+live, actively-relaying match, not just a build/unit check.

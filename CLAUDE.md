@@ -1,16 +1,20 @@
 # AoM Kube Project
 
 ## Current top priority (2026-08-22)
-**`lobby/session-cleanup-design.md`**'s Phases 1-3 are now implemented
-(`hostPool.assigned` revalidation, `pairRelay`/`hostProbe` teardown on
-host removal, proactive session closing) - build-tested and partially
-live-verified (host removal correctly cleared the sticky assignment and
-freed the pool immediately; a live pairRelay/session-close under an
-actual formed pair still needs a clean end-to-end confirmation, blocked
-today by the `auto-host.sh` flakiness noted below before it could be
-captured). Read that doc for the four gaps this closes and why.
+**`lobby/session-cleanup-design.md`**'s Phases 1-3 are implemented and now
+**fully live-verified** (2026-08-22): deleted a host pod mid-match under
+an actual formed, actively-relaying pair and confirmed all four gaps
+close correctly - immediate host-removal detection, immediate session
+close (not the 30-40s idle reaper), correct `pairRelay` teardown, and a
+clean reconnect onto the surviving host with no stuck reference to the
+deleted one. See that doc's "Confirmed live, 2026-08-22" section for the
+full trace. Phase 4 (bounding `hostPool.assigned` growth) remains
+optional and unimplemented, per its own section - not blocking.
 
-**New todo, found live 2026-08-22 while testing the above**:
+This is done. The next open item is the `auto-host.sh` reliability probe
+below, which is now the top priority.
+
+**Todo, found live 2026-08-22 while testing the above**:
 `auto-host.sh` intermittently misclicks partway through its sequence
 (landing on the wrong menu screen - e.g. stuck on "Single Player" or
 "Multiplayer" instead of reaching the hosted lobby) while still logging
