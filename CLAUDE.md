@@ -1,17 +1,36 @@
 # AoM Kube Project
 
-## Current top priority (2026-08-20)
-**`lobby/session-cleanup-design.md`** - session/host lifecycle cleanup.
-The P2P pairing mystery is resolved (see `docs/multi-peer-routing-design.md`'s
-"Update (2026-08-20)" section and `docs/directplay8-protocol.md`'s "Common
-wrapper" correction), but fixing it live surfaced a real, reproduced bug
-in the N-host pool's own cleanup story: a client stuck sticky-bound to a
-host pod that no longer existed, with no in-process recovery short of
-restarting `aom-lobby`. That doc covers four related gaps found tracing
-the same area (`hostPool.assigned` never revalidated, a removed host's
-`pairRelay`/`hostProbe` goroutines never torn down, its sessions never
-proactively closed) and the fix plan for all four. Read that first if
-picking this project up.
+## Current top priority (2026-08-22)
+**`lobby/session-cleanup-design.md`**'s Phases 1-3 are now implemented
+(`hostPool.assigned` revalidation, `pairRelay`/`hostProbe` teardown on
+host removal, proactive session closing) - build-tested and partially
+live-verified (host removal correctly cleared the sticky assignment and
+freed the pool immediately; a live pairRelay/session-close under an
+actual formed pair still needs a clean end-to-end confirmation, blocked
+today by the `auto-host.sh` flakiness noted below before it could be
+captured). Read that doc for the four gaps this closes and why.
+
+**New todo, found live 2026-08-22 while testing the above**:
+`auto-host.sh` intermittently misclicks partway through its sequence
+(landing on the wrong menu screen - e.g. stuck on "Single Player" or
+"Multiplayer" instead of reaching the hosted lobby) while still logging
+"done" and exiting 0, so nothing today detects or recovers from this -
+`/hosts` just silently never reaches the expected count and the pod sits
+broken until someone notices and manually deletes it. Hit twice in one
+session under concurrent load (3 client containers + 2 host pods on one
+dev machine, matching the exact CPU-contention/dropped-keystroke risk
+this project's own docs already flag for `xdotool` under
+`llvmpipe`-software-rendered load). **Proposed fix, not yet designed in
+detail**: a Kubernetes liveness or readiness probe on the `aom-headless`
+deployment that actually verifies the hosted state (not just "auto-host.sh
+exited 0") and lets Kubernetes' own restart-on-failed-probe behavior
+retry automatically instead of silently leaving a broken pod in place.
+Needs a real signal to probe - candidates: extend `input-agent` with a
+`/healthz`-style endpoint that either checks for a completion marker
+`auto-host.sh` writes only after confirming (not just clicking through)
+success, or has `input-agent` itself fire the same `0x25`/`0x26`
+discovery-port check `aom-lobby`'s own `hostProbe` already does, from
+inside the pod.
 
 ## What this is
 Kubernetes/Docker setup to modernise Age of Mythology (original) network hosting,
