@@ -63,6 +63,20 @@ spec:
           env:
             - name: ENABLE_VNC
               value: "1"
+            # Both needed by healthcheck.sh (this Deployment's own
+            # livenessProbe.exec target, see docs/host-health-probe-design.md)
+            # to ask the right node-local host-health-agent about the
+            # right pod - neither is known until the pod is actually
+            # scheduled, hence the downward API rather than a literal
+            # value.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
             # Diagnostic pass, 2026-08-12 (see lobby/packet-handling-design.md's
             # "what changes I'd make" discussion): entrypoint.sh's final
             # `exec "$@"` inherits this like any other env var, and Wine
@@ -105,3 +119,27 @@ spec:
             limits:
               cpu: "2"
               memory: "2Gi"
+          # Detects a silently-stuck auto-host.sh run (misclicks onto the
+          # wrong menu screen but still exits 0 - see CLAUDE.md's top
+          # todo and docs/host-health-probe-design.md for the full
+          # design/evidence) by asking this node's host-health-agent
+          # (k8s/host-health-agent-daemonset.yaml) whether this specific
+          # pod has actually reached a hosted, discoverable state.
+          #
+          # initialDelaySeconds is generous (100s) because auto-host.sh's
+          # own sequence "takes well over a minute" per CLAUDE.md - firing
+          # any earlier would restart pods that were still mid-sequence,
+          # not actually stuck. failureThreshold (3) at periodSeconds
+          # (10s) rides out hostProbe's own documented single-cycle
+          # false-negative window (a host added within the last
+          # podPollInterval briefly reads not-live - see hostLive's own
+          # doc comment in lobby/main.go) several times over, so this
+          # only ever trips for a pod that never reaches the hosted state
+          # at all, not one merely slow to report it the first time.
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/healthcheck.sh"]
+            initialDelaySeconds: 100
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3

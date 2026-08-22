@@ -79,6 +79,13 @@ RUN chmod +x /home/aomuser/entrypoint.sh
 COPY --chown=aomuser:aomuser ./auto-host.sh /usr/local/bin/auto-host.sh
 RUN chmod +x /usr/local/bin/auto-host.sh
 
+# healthcheck.sh (see that script and docs/host-health-probe-design.md) -
+# the Deployment's own livenessProbe.exec target, asking this node's
+# host-health-agent whether this pod has actually reached a hosted state
+# (catches auto-host.sh runs that misclick and exit 0 anyway).
+COPY --chown=aomuser:aomuser ./healthcheck.sh /usr/local/bin/healthcheck.sh
+RUN chmod +x /usr/local/bin/healthcheck.sh
+
 COPY --chown=aomuser:aomuser ./aom_files /home/aomuser/aom
 WORKDIR /home/aomuser/aom
 

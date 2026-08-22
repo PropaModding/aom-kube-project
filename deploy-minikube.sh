@@ -19,6 +19,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 IMAGE_TAG="aom-k8s:latest"
 LOBBY_IMAGE_TAG="aom-lobby:latest"
+HEALTH_AGENT_IMAGE_TAG="host-health-agent:latest"
 
 if ! minikube status >/dev/null 2>&1; then
     echo "[*] minikube is not running, starting it..."
@@ -34,6 +35,9 @@ docker build -f "$SCRIPT_DIR/dockerfile.k8s" -t "$IMAGE_TAG" "$SCRIPT_DIR"
 echo "[*] Building $LOBBY_IMAGE_TAG from dockerfile.lobby..."
 docker build -f "$SCRIPT_DIR/dockerfile.lobby" -t "$LOBBY_IMAGE_TAG" "$SCRIPT_DIR"
 
+echo "[*] Building $HEALTH_AGENT_IMAGE_TAG from dockerfile.host-health-agent..."
+docker build -f "$SCRIPT_DIR/dockerfile.host-health-agent" -t "$HEALTH_AGENT_IMAGE_TAG" "$SCRIPT_DIR"
+
 echo "[*] Pointing docker CLI back at the host's own daemon (the docker-"
 echo "    env eval above redirected it to minikube's internal daemon,"
 echo "    which the client-isolation section further below needs to NOT"
@@ -44,10 +48,19 @@ eval "$(minikube docker-env --unset)"
 
 echo "[*] Applying k8s manifests..."
 kubectl apply -f "$SCRIPT_DIR/k8s/lobby-rbac.yaml"
+kubectl apply -f "$SCRIPT_DIR/k8s/host-health-agent-rbac.yaml"
+kubectl apply -f "$SCRIPT_DIR/k8s/host-health-agent-daemonset.yaml"
 kubectl apply -f "$SCRIPT_DIR/k8s/aom-headless-deployment.yaml"
 kubectl apply -f "$SCRIPT_DIR/k8s/lobby-deployment.yaml"
 
 echo "[*] Waiting for rollout..."
+# host-health-agent first: aom-headless's own livenessProbe calls into it
+# (see healthcheck.sh) - it fails open if unreachable, so this isn't
+# strictly required for correctness, but starting it first means real
+# health data is available from the earliest possible moment rather than
+# every pod's first several checks running in the fail-open/unknown
+# state.
+kubectl rollout status daemonset/host-health-agent --timeout=60s
 kubectl rollout status deployment/aom-headless --timeout=180s
 kubectl rollout status deployment/aom-lobby --timeout=60s
 

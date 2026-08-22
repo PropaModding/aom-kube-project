@@ -1,0 +1,61 @@
+# host-health-agent: one pod per node, watching every node-local
+# aom-headless pod's discovery port and reporting whether it's actually
+# hosting - see docs/host-health-probe-design.md for the full design and
+# host-health-agent/main.go for the check itself.
+#
+# hostNetwork so it's reachable at the node's own IP without a Service -
+# each aom-headless pod's own livenessProbe (see
+# k8s/aom-headless-deployment.yaml's healthcheck.sh) calls back into this
+# agent via $NODE_IP (its own status.hostIP, from the downward API), the
+# same node address aom-lobby itself already runs on. No NetworkPolicy
+# change needed for this: k8s/aom-headless-netpol.yaml's egress rule only
+# denies the docker-bridge client subnet and re-allows that one node
+# address specifically - see the design doc's "NetworkPolicy analysis"
+# section for the full correction (this was first assumed to need a new
+# exception; it doesn't).
+#
+# DaemonSet, not Deployment: NODE_NAME (downward API, spec.nodeName)
+# scopes each agent to just the pods scheduled on its own node - the
+# actual reason to run one per node rather than one shared instance
+# cluster-wide, even though today's single-node minikube cluster makes
+# the practical difference moot.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: host-health-agent
+  labels:
+    app: host-health-agent
+spec:
+  selector:
+    matchLabels:
+      app: host-health-agent
+  template:
+    metadata:
+      labels:
+        app: host-health-agent
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: host-health-agent
+      containers:
+        - name: host-health-agent
+          image: host-health-agent:latest
+          imagePullPolicy: Never # image is loaded straight into the node, not pulled from a registry
+          ports:
+            - name: status-http
+              containerPort: 8090
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: ":8090"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"

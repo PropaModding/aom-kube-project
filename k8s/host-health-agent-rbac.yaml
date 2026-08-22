@@ -1,0 +1,33 @@
+# Grants host-health-agent exactly what it needs (host-health-agent/main.go)
+# to discover aom-headless pods scheduled to its own node: get/list/watch
+# on Pods, nothing else - same shape and same justification as
+# k8s/lobby-rbac.yaml grants aom-lobby's own podLister. This agent never
+# acts on a pod either, only reads its IP/phase; a pod's own Kubernetes
+# liveness probe (not this agent) is what triggers a restart. Namespaced
+# (Role, not ClusterRole), matching every other RBAC object in this
+# project.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: host-health-agent
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: host-health-agent-pod-reader
+rules:
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: host-health-agent-pod-reader
+subjects:
+  - kind: ServiceAccount
+    name: host-health-agent
+roleRef:
+  kind: Role
+  name: host-health-agent-pod-reader
+  apiGroup: rbac.authorization.k8s.io

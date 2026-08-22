@@ -1,11 +1,12 @@
 # Host health probe: detecting a silently-stuck `auto-host.sh` run
 
-**Status: design only, not yet implemented.** Written 2026-08-22 to close
-out the todo recorded at the top of `CLAUDE.md`. Read that entry first
-for the live incident that motivated this (`auto-host.sh` misclicking
-partway through its EULA-\>menus-\>hosted-lobby sequence, landing on the
-wrong screen while still logging "done" and exiting 0 - hit twice in one
-session under concurrent load).
+**Status: implemented and fully live-verified, 2026-08-22.** Written to
+close out the todo recorded at the top of `CLAUDE.md`. Read that entry
+first for the live incident that motivated this (`auto-host.sh`
+misclicking partway through its EULA-\>menus-\>hosted-lobby sequence,
+landing on the wrong screen while still logging "done" and exiting 0 -
+hit twice in one session under concurrent load). See "Confirmed live,
+2026-08-22" at the end of this doc for the full end-to-end test.
 
 ## What's actually broken, and what isn't
 
@@ -345,6 +346,61 @@ report it the first time.
    while a genuinely healthy `aom-headless` pod is running; confirm the
    pod's own liveness probe keeps passing (exit-0 fallback in
    `healthcheck.sh`) rather than the whole pool restarting together.
+
+### Confirmed live, 2026-08-22
+
+Implemented exactly as designed - `host-health-agent/main.go`,
+`dockerfile.host-health-agent`, `k8s/host-health-agent-rbac.yaml`,
+`k8s/host-health-agent-daemonset.yaml`, `healthcheck.sh` baked into
+`dockerfile.k8s`, and the `POD_NAME`/`NODE_IP`/`livenessProbe` additions
+to `k8s/aom-headless-deployment.yaml`. Build-verified first (`go build`/
+`go vet`/`gofmt -l` clean, both Docker images build clean, both new/
+edited manifests pass `kubectl apply --dry-run=client`), then deployed
+and exercised live end-to-end:
+
+- **Real hosting transitions tracked correctly.** Two freshly-rolled
+  pods both read `503` from `host-health-agent` while mid `auto-host.sh`,
+  then flipped to `200` at the same moment (~50s in) - cross-checked
+  against `aom-lobby`'s own independent `/hosts` count (2), which agreed
+  exactly, confirming this agent's probe result matches `hostProbe`'s own
+  assessment of the same pods (expected, since it's the identical check).
+- **No false-positive restarts.** Both healthy pods sat well past
+  `initialDelaySeconds` (100s) with zero `Unhealthy` events and
+  `RESTARTS` staying at 0.
+- **The actual recovery path, proven twice - the second time correctly:**
+  - First attempt used `pkill -f aomxnocd1.exe` inside a healthy pod to
+    simulate a stuck host. This *did* produce a restart, but for the
+    wrong reason - the container's own PID 1 (`tini`, directly
+    supervising that process) exited the instant its child died,
+    triggering Kubernetes' ordinary `restartPolicy: Always` container-
+    crash-restart, not this design's `livenessProbe` at all (confirmed
+    via `lastState.terminated`: `exitCode: 143`, timestamped to the
+    exact second of the `pkill`, restart already visible before
+    `failureThreshold`'s ~30s window could have elapsed). Also not a
+    faithful reproduction of the actual bug anyway - the real
+    `auto-host.sh` misclick leaves the game process *alive*, just stuck
+    on the wrong screen; killing it outright is a different failure mode.
+  - Redone correctly with `kill -STOP` on the game process specifically
+    (confirmed via `ps -o pid,stat` showing `STAT=Tl`, genuinely paused,
+    not terminated) - this leaves `tini`/the container's main process
+    untouched, isolating the test to exactly this design's own chain.
+    Result: `host-health-agent` read `503` within one probe cycle;
+    Kubernetes' own events then showed, in order,
+    `Warning Unhealthy: Liveness probe failed` followed by
+    `Normal Killing: Container aom failed liveness probe, will be
+    restarted`, ~30s later (matching `failureThreshold: 3` \*
+    `periodSeconds: 10`) - unambiguous proof this design's own probe
+    chain, not some other mechanism, triggered the restart.
+  - The restarted pod then ran a fresh `auto-host.sh` cycle from scratch
+    and reported `200` again ~50s later - the full detect-\>restart-\>
+    recover loop confirmed end-to-end, not just the detection half.
+
+Not separately re-run: the fail-open check (item 3 above) - covered by
+code review of `healthcheck.sh`'s `case` statement (only `200`/`503` are
+distinguished; everything else, including a `curl` failure, falls to the
+`exit 0` default) rather than a live agent-outage simulation, since the
+live restart-path test already confirmed the rest of the chain works and
+this branch is a simple, low-risk default case.
 
 ## Explicitly out of scope for this pass
 

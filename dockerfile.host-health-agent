@@ -1,0 +1,17 @@
+# host-health-agent: a per-node DaemonSet that probes every node-local
+# aom-headless pod's discovery port and reports whether it's actually
+# hosting, so each pod's own Kubernetes livenessProbe can restart itself
+# on a silently-stuck auto-host.sh run. See
+# docs/host-health-probe-design.md and host-health-agent/main.go.
+
+FROM golang:1.22-alpine AS builder
+WORKDIR /src
+COPY host-health-agent/go.mod ./
+COPY host-health-agent/main.go ./
+RUN CGO_ENABLED=0 go build -o /host-health-agent .
+
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates
+COPY --from=builder /host-health-agent /usr/local/bin/host-health-agent
+EXPOSE 8090
+ENTRYPOINT ["/usr/local/bin/host-health-agent"]
