@@ -925,6 +925,28 @@ type hostProbe struct {
 
 	mu   sync.Mutex
 	open bool
+
+	// stop, once closed, ends run()'s loop - see removeHost's own doc
+	// comment (lobby/session-cleanup-design.md's Gap 3/Phase 2): before
+	// this existed, a removed host's probe goroutine ran forever, one
+	// leaked goroutine per host churned out of the pool for the life of
+	// the process. Buffered/closed rather than sent-to, so calling
+	// stop() more than once (shouldn't happen, but cheap to make safe)
+	// doesn't panic - see hostProbe.stopOnce below.
+	stop     chan struct{}
+	stopOnce sync.Once
+}
+
+// newHostProbe constructs a hostProbe with its stop channel initialized -
+// callers should use this rather than a bare struct literal now that
+// run() depends on stop being non-nil.
+func newHostProbe(backendAddr string) *hostProbe {
+	return &hostProbe{backendAddr: backendAddr, stop: make(chan struct{})}
+}
+
+// stopProbe ends this probe's run() goroutine - idempotent (see stopOnce).
+func (h *hostProbe) stopProbe() {
+	h.stopOnce.Do(func() { close(h.stop) })
 }
 
 func (h *hostProbe) run() {
@@ -932,7 +954,11 @@ func (h *hostProbe) run() {
 	defer ticker.Stop()
 	for {
 		h.probeOnce()
-		<-ticker.C
+		select {
+		case <-h.stop:
+			return
+		case <-ticker.C:
+		}
 	}
 }
 
@@ -1051,6 +1077,16 @@ type hostPool struct {
 	// decides open" section), but the real session count sessionProxy
 	// already tracks per host can.
 	sessionCountForHost func(*hostCandidate) int
+	// closeSessionsForHost is sessionProxy/discoveryProxy's own combined
+	// session-close callback, wired up in main() the same after-the-fact
+	// way as sessionCountForHost above (chicken-and-egg: hostPool exists
+	// before either proxy does). lobby/session-cleanup-design.md's Phase
+	// 3 - called from removeHost so a removed host's existing sessions
+	// close immediately instead of waiting out reapIdleSessions' idle
+	// timeout (which, per that doc's Gap 2, isn't even a guaranteed
+	// backstop for a session a still-"active" orphaned pair relay is
+	// protecting from being reaped).
+	closeSessionsForHost func(hostID string)
 	// assigned makes host selection sticky per real client IP for the
 	// life of that client's connection (and any later reconnect/rejoin -
 	// matches this project's already-confirmed same-client-rejoin
@@ -1064,21 +1100,24 @@ type hostPool struct {
 	// ports for the same real player (see clientTracker's own doc
 	// comment on the same distinction).
 	//
-	// Known limitation, unchanged by the move to dynamic discovery: if a
-	// client's assigned host is later removed from the pool (its pod
-	// died/rescheduled mid-match - see removeHost), this map still points
-	// at the now-gone hostCandidate, and that client's traffic will keep
-	// trying to reach a dead pod until its session naturally idles out
-	// (reapIdleSessions) rather than being re-matched. Graceful handling
-	// of a host disappearing mid-match is deliberately not solved in this
-	// pass - same "flag the gap, don't silently assume it away" practice
-	// this file already applies elsewhere (see onClientGone's own
-	// not-wired-up status).
+	// Fixed 2026-08-22 (lobby/session-cleanup-design.md's Phase 1): used
+	// to never be revalidated or invalidated at all - a client's assigned
+	// host being removed from the pool (pod died/rescheduled) left this
+	// map pointing at the now-gone hostCandidate forever, with no
+	// in-process recovery short of restarting aom-lobby - reproduced
+	// live 2026-08-20. Now handled two ways: removeHost proactively
+	// deletes any entry pointing at the host it's removing, and
+	// assignForClient itself revalidates a cache hit against the live
+	// pool before trusting it (see hostStillPresentLocked) as a backstop
+	// for anything the proactive path might miss.
 	//
-	// Also still leaks one entry per distinct client IP ever seen for the
-	// life of the process - acceptable for this project's dev/test scope
-	// (CLAUDE.md's Goals), revisit if this ever runs long-lived against
-	// real traffic.
+	// Still leaks one entry per distinct client IP ever seen whose host
+	// stays alive for the life of the process - acceptable for this
+	// project's dev/test scope (CLAUDE.md's Goals; see
+	// lobby/session-cleanup-design.md's Phase 4 for the optional TTL
+	// sweep this would need to fully bound, not required by anything
+	// else here), revisit if this ever runs long-lived against real
+	// traffic.
 	assigned map[string]*hostCandidate
 }
 
@@ -1088,18 +1127,27 @@ type hostPool struct {
 // Returns (nil, false) if no host is currently eligible - the pool is
 // empty (brief window at startup before podLister's first successful
 // poll lands, or every known host has been removed - see removeHost), or
-// every host is full (packet-handling-design.md's case 3). Callers must
+// every host is full (packet-handling-design.md's case 3, handled by
+// synthesizeLobbyFullRejection rather than a plain drop - see
+// packet-handling-design.md's "Case 3 in detail" section). Callers must
 // handle this rather than assume a host always exists, unlike the old
 // static-config version where an empty pool was a startup-time fatal
-// error, not a runtime possibility. Case 3 is a plain drop today, not a
-// spoofed "lobby full" rejection - see synthesizeLobbyFullRejection's own
-// doc comment on why that's still blocked on a reference capture that
-// hasn't been taken.
+// error, not a runtime possibility.
 func (p *hostPool) assignForClient(clientIP string) (*hostCandidate, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if h, ok := p.assigned[clientIP]; ok {
-		return h, true
+		if p.hostStillPresentLocked(h) {
+			return h, true
+		}
+		// Stale - h was removed from the pool since this client was last
+		// assigned (see this field's own 2026-08-22 doc comment).
+		// removeHost should normally have already deleted this entry
+		// itself; this is the reactive backstop for anything that
+		// ordering might miss. Fall through to a fresh pick below rather
+		// than handing back a dead host.
+		log.Printf("[pool] client %s's assigned host %s is no longer in the pool, reassigning", clientIP, h.id)
+		delete(p.assigned, clientIP)
 	}
 	h, ok := p.selectLocked()
 	if !ok {
@@ -1110,6 +1158,21 @@ func (p *hostPool) assignForClient(clientIP string) (*hostCandidate, bool) {
 	}
 	p.assigned[clientIP] = h
 	return h, true
+}
+
+// hostStillPresentLocked reports whether target is still a live member
+// of p.hosts - must be called with p.mu already held (assignForClient's
+// only caller). A plain linear scan is deliberate, not a placeholder for
+// a future map: this project's host count is small by design (CLAUDE.md's
+// Goals - a handful of hosts at most), so a second index kept in sync
+// with p.hosts would be more bookkeeping than the scan it replaces.
+func (p *hostPool) hostStillPresentLocked(target *hostCandidate) bool {
+	for _, h := range p.hosts {
+		if h == target {
+			return true
+		}
+	}
+	return false
 }
 
 // maxRealClientsPerHost is this project's fixed 1v1 scope (CLAUDE.md's
@@ -1302,18 +1365,40 @@ func (p *hostPool) addHost(h *hostCandidate) {
 }
 
 // removeHost drops a pod that's no longer listed (deleted/rescheduled/
-// scaled down) from the pool. Does NOT touch any client's sticky
-// assignment (see assigned's own doc comment on the known gap that
-// leaves) or tear down the removed host's pairRelay/matchState - existing
-// sessions referencing it simply become orphaned and eventually idle out
-// via reapIdleSessions, same as any other silently-gone backend.
+// scaled down) from the pool, and tears down everything that pod's
+// hostCandidate owned - lobby/session-cleanup-design.md, fixed
+// 2026-08-22. Before this, none of the following happened: a client's
+// sticky assignment to this host lived on forever (Gap 1, reproduced
+// live 2026-08-20 - see assigned's own doc comment), this host's
+// pairRelay (if any) and hostProbe goroutine just kept running
+// indefinitely (Gaps 2/3), and its existing sessions were left to
+// idle-timeout on their own rather than being closed immediately (Gap
+// 4). All four are addressed here, in the same critical section (see
+// this file's established hostPool.mu-then-proxy.mu lock ordering,
+// documented in forwardToBackend's own 2026-08-14 correction - calling
+// into closeSessionsForHost, which takes a proxy's own p.mu, is safe in
+// this direction, not the reverse).
 func (p *hostPool) removeHost(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	for i, h := range p.hosts {
 		if h.id == id {
 			p.hosts = append(p.hosts[:i], p.hosts[i+1:]...)
+			for clientIP, assignedHost := range p.assigned {
+				if assignedHost == h {
+					delete(p.assigned, clientIP)
+				}
+			}
 			log.Printf("[pool] host removed: %s (no longer listed)", id)
+			if h.probe != nil {
+				h.probe.stopProbe()
+			}
+			if h.match != nil {
+				h.match.teardownForRemovedHost()
+			}
+			if p.closeSessionsForHost != nil {
+				p.closeSessionsForHost(id)
+			}
 			return
 		}
 	}
@@ -1634,7 +1719,7 @@ func (pl *podLister) reconcileOnce(pool *hostPool) {
 			sessionBackendUDPAddr: sessionUDPAddr,
 			inputAgentAddr:        fmt.Sprintf("%s:%d", pod.ip, headlessInputAgentPort),
 			match:                 &matchState{cfg: pl.cfg, closeSession: pl.closeSession},
-			probe:                 &hostProbe{backendAddr: discoveryAddr},
+			probe:                 newHostProbe(discoveryAddr),
 		}
 		pool.addHost(h)
 		go h.probe.run()
@@ -1892,6 +1977,34 @@ func (p *proxy) closeSession(clientAddr *net.UDPAddr) {
 		return
 	}
 	sess.backendConn.Close()
+}
+
+// closeSessionsForHost is closeSession generalized to every session
+// belonging to hostID, not just one client - lobby/session-cleanup-
+// design.md's Phase 3, called (via hostPool.closeSessionsForHost) from
+// removeHost so a removed host's sessions close immediately rather than
+// waiting out reapIdleSessions' idle timeout. Same sess.host.id filter
+// otherSessionClientAddr already uses elsewhere in this file. Collects
+// matches under p.mu, then closes outside it - same
+// collect-then-act-unlocked shape reapIdleSessions already uses, so one
+// slow/blocking Close doesn't hold up every other session's lookup.
+// Deliberately just closes backendConn, same as closeSession: the actual
+// map removal and onSessionRemoved firing happen in backendToClient's
+// own read-error path once the close is observed there, not duplicated
+// here.
+func (p *proxy) closeSessionsForHost(hostID string) {
+	p.mu.Lock()
+	var toClose []*session
+	for _, sess := range p.sessions {
+		if sess.host != nil && sess.host.id == hostID {
+			toClose = append(toClose, sess)
+		}
+	}
+	p.mu.Unlock()
+	for _, sess := range toClose {
+		log.Printf("[%s] closing session for client %s (host %s removed)", p.name, sess.clientAddr, hostID)
+		sess.backendConn.Close()
+	}
 }
 
 func (p *proxy) run() {
@@ -3132,27 +3245,26 @@ func (m *matchState) ensurePairRelay(selfAddr, otherAddr *net.UDPAddr) *pairRela
 // onClientGone tears down whatever this match knows about addr - the
 // scoped-teardown half of durability (docs/multi-peer-routing-design.md's
 // "Durability" section), meant to be the single place that reacts to a
-// departure regardless of cause.
+// single client's departure regardless of cause.
 //
-// Correction (2026-08-12): not currently called from anywhere - see
-// sessionProxy's construction in main(). A previous wiring (fire this
-// from proxy.onSessionRemoved, covering both an eventual real resign
-// signal and the idle-timeout reaper) reproduced the exact "Attempting
-// to Connect" hang durability was meant to fix: the idle-timeout reaper
-// doesn't distinguish "client actually left" from "client's host-facing
-// traffic happened to go quiet because it's busy on the P2P leg
-// instead," and firing this function on the latter kills a pair relay
-// that's still needed - observed live, killing the second client's
-// handshake mid-attempt. Kept defined and ready to wire back up once
-// there's a real departure signal (a confirmed resign burst, not the
-// still-unconfirmed shape isResignBurst currently only logs).
+// Re-wired 2026-08-14 (this comment was stale until 2026-08-22 - it used
+// to say "not currently called from anywhere," referencing the
+// 2026-08-11 regression that originally made this unsafe): now called
+// from sessionProxy's onSessionRemoved, gated by reapIdleSessions' own
+// dual-channel check (pairRelay.idleFor) so a session busy on the P2P
+// leg doesn't look idle on the host channel alone and get reaped out
+// from under a still-healthy pairing - see reapIdleSessions' own doc
+// comment for the fix that made re-wiring this safe.
 //
 // Deliberately scoped to just addr: if addr isn't part of the current
 // pair, this only removes its ready-state entry and does nothing to
 // m.pair, so the surviving client's own session (tracked entirely
 // separately, in sessionProxy.sessions) and its pairing are never
 // touched - isolation falls out of this function only ever acting on
-// the one address it's given, not from any global reset.
+// the one address it's given, not from any global reset. See
+// teardownForRemovedHost below for the unconditional, whole-host
+// version of this - used when the host itself is gone, not just one
+// client.
 //
 // m.started is deliberately NOT reset here: it guards against re-
 // triggering the host's Ready-crystal click, not connection lifecycle -
@@ -3169,6 +3281,29 @@ func (m *matchState) onClientGone(addr *net.UDPAddr) {
 		return
 	}
 	log.Printf("[match] %s departed, tearing down pair relay", addr)
+	m.pair.conn.Close()
+	m.pair = nil
+}
+
+// teardownForRemovedHost unconditionally tears down this match's pair
+// relay, if one exists, and clears its ready state - the whole-host
+// counterpart to onClientGone's single-client scoping.
+// lobby/session-cleanup-design.md's Phase 2: called from removeHost when
+// the host this matchState belongs to has disappeared from the pool
+// entirely (pod deleted/rescheduled/scaled down), not just one client
+// leaving it. Unlike onClientGone, there's no "is addr part of the
+// current pair" check to make - the whole host is gone, so there's no
+// remaining peer whose state needs preserving. Safe to call on a match
+// with no pair formed yet (no-op beyond clearing ready, same as
+// onClientGone's own nil-pair path).
+func (m *matchState) teardownForRemovedHost() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.ready = nil
+	if m.pair == nil {
+		return
+	}
+	log.Printf("[match] host removed, tearing down pair relay %s", m.pair.name)
 	m.pair.conn.Close()
 	m.pair = nil
 }
@@ -3542,6 +3677,15 @@ func main() {
 	// within one podPollInterval.
 	podLister.closeSession = sessionProxy.closeSession
 	pool.sessionCountForHost = sessionProxy.sessionCountForHost
+	// pool.closeSessionsForHost (lobby/session-cleanup-design.md's Phase
+	// 3), same wiring-after-construction reason as the two lines above -
+	// a removed host can have sessions in either proxy's own map
+	// (discovery-port and session-port sessions are tracked separately),
+	// so removeHost needs to reach both.
+	pool.closeSessionsForHost = func(hostID string) {
+		discoveryProxy.closeSessionsForHost(hostID)
+		sessionProxy.closeSessionsForHost(hostID)
+	}
 	// See onDiscoveryPingNoHost's own doc comment on *proxy - lets
 	// discoveryProxy kick off sessionProxy's proactive synthesized
 	// host-open as soon as it answers a client's 0x20 ping, rather than
