@@ -106,6 +106,20 @@ const (
 	// caveat as joinCushion above.
 	postLandCooldown = 5 * time.Second
 
+	// resignBurstDrain is how long to hold off actually tearing down a
+	// session/relay after detecting a confident pre-match resign burst
+	// (lobby/resign-burst-design.md) - purely to let the burst itself
+	// finish flowing through *normally* first. Found live 2026-08-23:
+	// closing the connection in the same call that detected the burst
+	// raced ahead of the packet's own delivery, so neither the real host
+	// nor the surviving peer reliably received it at all - the whole
+	// reason this is sent as ten rapid redundant copies (confirmed
+	// ~1ms apart in the original 2026-08-03 capture) is to survive normal
+	// packet loss, not proxy-induced loss of every copy. Comfortably
+	// longer than that ~1ms burst duration, still nowhere near the 30s
+	// idleTimeout baseline this design replaces.
+	resignBurstDrain = 100 * time.Millisecond
+
 	// otherSessionPollTimeout/Interval bound pollOtherSessionClientAddr's
 	// retry loop - see that method's doc comment. 5s is generous relative
 	// to how close together both real clients' sessions were observed
@@ -1906,6 +1920,14 @@ type session struct {
 	mu       sync.Mutex
 	lastSeen time.Time
 
+	// resignCheckPending guards against acting on a redundant resign
+	// burst for every one of its ten identical copies (see
+	// lobby/resign-burst-design.md) - set the first time a pre-match
+	// burst triggers teardown for this session. Purely a debounce (the
+	// underlying teardown calls are already idempotent), guarded by mu
+	// like lastSeen above.
+	resignCheckPending bool
+
 	// connID/connIDKnown record the backend's own wrapper conn-ID (see
 	// wrapperConnID) for this specific client relationship, learned the
 	// first time a "03 00"-wrapped packet is correctly attributed to
@@ -3204,10 +3226,12 @@ type pairRelay struct {
 	selfPort uint16
 	addrA    *net.UDPAddr
 	addrB    *net.UDPAddr
-	// onResign, if set, is called with a peer's address when a resign
-	// burst crosses this relay (see isResignBurst) - lets main() hook
-	// client<->client resign detection into the same session-teardown
-	// path as client<->host resign detection (see proxy.closeSession).
+	// onResign, if set, is called with a peer's address once a resign-
+	// shaped burst from it has been confirmed via a silence window (see
+	// run()'s own isResignBurst handling and
+	// lobby/resign-burst-design.md) - wired in ensurePairRelay to
+	// matchState.onClientGone, the same teardown client<->host departures
+	// already use.
 	onResign func(peerAddr *net.UDPAddr)
 
 	// mu guards lastSeenA/lastSeenB - per-endpoint activity tracking,
@@ -3219,6 +3243,15 @@ type pairRelay struct {
 	mu        sync.Mutex
 	lastSeenA time.Time
 	lastSeenB time.Time
+
+	// resignCheckPendingA/B debounce a resign burst's ten identical
+	// copies down to one onResign call each (see run()'s own
+	// isResignBurst handling and lobby/resign-burst-design.md) - not
+	// correctness-critical (the teardown onResign leads to is
+	// idempotent), just avoids nine redundant calls/log lines. Guarded by
+	// mu like lastSeenA/B above.
+	resignCheckPendingA bool
+	resignCheckPendingB bool
 
 	// notified records which real client addresses have definitely
 	// received their own peer-address broadcast - either the genuine one
@@ -3396,13 +3429,28 @@ func (r *pairRelay) run() {
 		r.mu.Unlock()
 
 		if isResignBurst(payload) {
-			// Logging only, NOT calling onResign - see isResignBurst's doc
-			// comment's 2026-08-11 correction. onResign is left wired to
-			// nothing for now (see ensurePairRelay) until this shape is
-			// properly confirmed as an actual resign in this direction too.
-			log.Printf("[%s] resign-shaped burst from %s seen (not acted on, see isResignBurst)", r.name, src)
-			if r.onResign != nil {
-				r.onResign(src)
+			// Debounced pass-through to onResign - the pre-match/in-match
+			// decision (lobby/resign-burst-design.md's "Confirmed live"
+			// update) lives in that callback (wired in ensurePairRelay,
+			// which has matchState.hasStarted() available; this relay
+			// doesn't), not here. Ten identical copies per real burst would
+			// otherwise call onResign ten times - harmless (the teardown it
+			// leads to is idempotent) but noisy, so debounce per peer the
+			// same way sessionProxy's own rewriteToBackend does.
+			r.mu.Lock()
+			var alreadyActed bool
+			switch {
+			case udpAddrEqual(src, r.addrA):
+				alreadyActed, r.resignCheckPendingA = r.resignCheckPendingA, true
+			case udpAddrEqual(src, r.addrB):
+				alreadyActed, r.resignCheckPendingB = r.resignCheckPendingB, true
+			}
+			r.mu.Unlock()
+			if !alreadyActed {
+				log.Printf("[%s] resign-shaped burst from %s seen", r.name, src)
+				if r.onResign != nil {
+					r.onResign(src)
+				}
 			}
 		}
 
@@ -3481,9 +3529,32 @@ func (m *matchState) ensurePairRelay(selfAddr, otherAddr *net.UDPAddr) *pairRela
 		return relay
 	}
 	relay := newPairRelay("pair", m.cfg, selfAddr, otherAddr)
-	// NOT wiring relay.onResign to m.closeSession right now - see
-	// isResignBurst's doc comment's 2026-08-11 correction on why acting
-	// on this shape is currently disabled in both directions.
+	// Pre-match vs in-match, not silence - see lobby/resign-burst-
+	// design.md's "Confirmed live" update and sessionProxy's own
+	// rewriteToBackend for the identical reasoning on the client<->host
+	// side. A burst before hasStarted() is confident enough to act on
+	// immediately (matchState.onClientGone - the same teardown path
+	// client<->host departures already use); the known false positive
+	// was only ever observed during active gameplay, never before
+	// match-start. In-match stays logged only until that's solved
+	// separately.
+	relay.onResign = func(peerAddr *net.UDPAddr) {
+		if m.hasStarted() {
+			log.Printf("[pair] resign-shaped burst from %s in-match (not acted on, see resign-burst-design.md)", peerAddr)
+			return
+		}
+		log.Printf("[pair] resign-shaped burst from %s pre-match, tearing down in %s (letting the burst itself drain first)", peerAddr, resignBurstDrain)
+		// Deferred, not immediate - see resignBurstDrain's own doc
+		// comment: closing m.pair.conn (this same relay's r.conn) in the
+		// same call that's processing one of this burst's own packets
+		// would race ahead of run()'s own forward of that packet to the
+		// other peer, right below where onResign gets called - found live
+		// 2026-08-23 as the actual cause of a surviving peer never
+		// learning the other one left.
+		time.AfterFunc(resignBurstDrain, func() {
+			m.onClientGone(peerAddr)
+		})
+	}
 	go relay.run()
 	m.pair = relay
 	m.mu.Unlock()
@@ -3635,6 +3706,19 @@ func (m *matchState) markStarted() (alreadyStarted bool) {
 	return alreadyStarted
 }
 
+// hasStarted reports whether this match has been triggered yet (both
+// players readied up, triggerMatchStart fired) - used by the resign-burst
+// handling below (lobby/resign-burst-design.md) to tell a confident
+// pre-match lobby-leave from the riskier in-match case, where the same
+// burst shape is also known to fire as an unrelated periodic message
+// with no departure behind it at all (isResignBurst's own 2026-08-11
+// correction).
+func (m *matchState) hasStarted() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.started
+}
+
 // triggerMatchStart asks host's own input-agent (see input-agent/main.go)
 // to click that host's Ready crystal, the confirmed match-start trigger.
 // Plain HTTP over the pod network, straight to that host's own
@@ -3755,20 +3839,42 @@ func main() {
 		},
 		rewriteToBackend: func(payload []byte, cfg config, sess *session) []byte {
 			if isResignBurst(payload) {
-				// Logging only, NOT closing the session - see isResignBurst's
-				// doc comment's 2026-08-11 correction. Real 2-real-client
-				// testing showed this exact shape fires on a precise 2-minute
-				// period after every successful pairing (e.g. 12:36:30 ->
-				// 12:38:30 -> 12:40:41 -> ..., each gap exactly 2:00), with no
-				// user action behind it - not a resign, some other periodic
-				// protocol message (keepalive/re-sync?) coincidentally
-				// matching the documented resign shape. Acting on it was
-				// killing healthy sessions ~2 minutes into every game,
-				// reproducing the exact "Attempting to Connect" hang this
-				// whole durability pass was meant to fix. Left logged (not
-				// removed) since it's useful forensic data for whoever
-				// eventually captures a real resign to compare against.
-				log.Printf("[session] client %s resign-shaped burst seen (not acted on, see isResignBurst)", sess.clientAddr)
+				// Pre-match vs in-match, not silence - see
+				// lobby/resign-burst-design.md's "Confirmed live" update.
+				// The exact same 3-byte shape also fires on a precise
+				// 2-minute period after every successful pairing with no
+				// user action behind it at all (isResignBurst's own
+				// 2026-08-11 correction) - but confirmed live 2026-08-23
+				// that a genuine pre-match lobby-leave does NOT produce
+				// silence either (the connection keeps chattering normally
+				// afterward), so silence can't be the distinguishing
+				// feature here. What actually separates them: the known
+				// false positive was only ever observed *during* active
+				// gameplay (killing matches "about 2 minutes in"), never
+				// before match-start. A burst before hasStarted() is
+				// confident enough to act on immediately - the in-match
+				// case stays exactly as cautious as it's always been
+				// (logged only) until that's solved separately.
+				if sess.host != nil && sess.host.match != nil && !sess.host.match.hasStarted() {
+					sess.mu.Lock()
+					alreadyActed := sess.resignCheckPending
+					sess.resignCheckPending = true
+					sess.mu.Unlock()
+					if !alreadyActed {
+						log.Printf("[session] client %s resign-shaped burst seen pre-match, tearing down in %s (letting the burst itself drain first)", sess.clientAddr, resignBurstDrain)
+						clientAddr, host, backendConn := sess.clientAddr, sess.host, sess.backendConn
+						time.AfterFunc(resignBurstDrain, func() {
+							host.match.onClientGone(clientAddr)
+							// Triggers backendToClient's own read-error
+							// cleanup path - the same teardown every other
+							// departure already goes through
+							// (session-cleanup-design.md), not a new one.
+							backendConn.Close()
+						})
+					}
+				} else {
+					log.Printf("[session] client %s resign-shaped burst seen in-match (not acted on, see resign-burst-design.md)", sess.clientAddr)
+				}
 			}
 			if isReadyToggle(payload) {
 				ready := readyToggleState(payload)
