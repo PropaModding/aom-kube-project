@@ -32,15 +32,23 @@ by `firstClientJoinedAt` descending) - the intent being to free that
 player to reconnect and land on the *other*, longer-waiting host
 instead, consolidating two half-full games into one real match.
 
-**Known limitation, not fixed by this pass**: host *selection* on
-reconnect is still plain round-robin
-(`CLAUDE.md`'s "N-host round-robin matchmaking" section, still open) -
-nothing here guarantees the kicked client's reconnect actually lands
-back on the specific older host this sweep had in mind, only that they
-re-enter matchmaking. With a small pool this usually works out in
-practice, and a later sweep tick will catch it again if not - a
-best-effort consolidation, not a guaranteed one. Fixing the selection
-policy itself (prefer an already-waiting host) is out of scope here.
+**Correction (2026-08-24)**: this section previously claimed host
+selection on reconnect was "still plain round-robin," not guaranteeing
+the reconnect lands on the intended host. Wrong, and stale - re-checked
+directly against `hostPool.selectLocked`: it already implements a
+3-tier priority (prefer a host already waiting for a second player,
+then empty, then reject) that's been in place since the original N-host
+work (`docs/multi-peer-routing-design.md`'s own "N-host round-robin
+matchmaking (2026-08-13)" section - `CLAUDE.md`'s summary of this had
+drifted stale and got copied forward into this doc without
+cross-checking the more detailed one). As long as the *other* lonely
+host is still the only currently-waiting host when the kicked client
+reconnects, `selectLocked` deterministically routes them there - not a
+coin flip, confirmed by the 2-host live test. Round-robin only breaks
+ties *within* the waiting tier if more than one host is waiting at once
+(the genuine 3+-simultaneously-lonely case, still untested - see "Not
+yet tested" below), never causes a fallback to an empty host while any
+waiting one exists.
 
 ## The sequence, per kicked client (`warnAndKickLonelyPlayer`)
 
@@ -123,12 +131,16 @@ the two survivors. See
   pair per tick (the single youngest host) - untested whether repeated
   ticks correctly work through a larger backlog, or whether some other
   policy is needed once there are more than two.
-- **The round-robin selection limitation** (see "The policy" above)
-  with a pool larger than 2 hosts - the 2-host test that confirmed this
-  feature only had one possible "other" host to land on, so it
-  couldn't actually exercise whether reconnect selection reliably picks
-  the *intended* other lonely host specifically, versus some other host
-  entirely, in a larger pool.
+- **Round-robin tie-breaking among 3+ simultaneously-waiting hosts** -
+  see the correction above: `selectLocked` always prefers *some* waiting
+  host over an empty one, but if more than one host is waiting at the
+  same moment (3+ simultaneously-lonely hosts, not yet live-tested - see
+  the bullet above), round-robin picks among them without targeting the
+  specific one this sweep had in mind. Not necessarily a problem for
+  this feature's actual goal (landing on *any* waiting host still
+  consolidates two half-full games into one), but genuinely untested -
+  the 2-host test that confirmed this feature only ever had one possible
+  "other" host to land on.
 
 ## History
 
@@ -159,3 +171,31 @@ kicked client's reconnect landed on the *other* lonely host instead,
 confirmed by genuine peer-to-peer relay traffic between the two
 survivors. See "Confirmed live" above and
 `archiving/sessions/20260823-lonely-player-kick/`.
+
+**Third live test attempt (2026-08-24), scaling to 3 hosts / 5
+clients**: surfaced a second, more general sticky-assignment bug,
+unrelated to this feature's own mechanics. A client whose original host
+later filled with two *other* real clients (not via this feature's own
+kick - just normal matchmaking) got permanently stuck: `assignForClient`
+only ever invalidated a sticky `hostPool.assigned` entry when the host
+had been removed from the pool, never when it was simply full, so every
+reconnect attempt kept landing back on the same full host and
+idle-timing out - "game is full," with no way out, ever. Fixed by also
+checking `!p.hostFull(h)` before honoring a sticky assignment, falling
+through to a fresh `selectLocked` pick either way. See
+`archiving/sessions/20260823-lonely-player-kick/`'s
+`3-sticky-full-host-bug-evidence.log`.
+
+**Correction (2026-08-24)**: while investigating host selection for the
+3-host test, re-verified this doc's own "Known limitation" claim (host
+selection "still plain round-robin") directly against
+`hostPool.selectLocked` rather than trusting `CLAUDE.md`'s summary of
+it - the claim was simply wrong and stale, carried forward from
+`CLAUDE.md` without cross-checking `docs/multi-peer-routing-design.md`'s
+more detailed (and correct) account. The real 3-tier selection priority
+has been in place since the original N-host work, 2026-08-13. See "The
+policy" section above and `CLAUDE.md`'s own correction note for the
+full trail. The 3-host test itself was then interrupted by unrelated
+resource pressure (3 concurrent `aom-headless` pods oversubscribing the
+minikube VM's memory) before reaching a clean conclusion - still
+pending a retry.

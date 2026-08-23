@@ -1380,16 +1380,24 @@ func (p *hostPool) assignForClient(clientIP string) (*hostCandidate, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if h, ok := p.assigned[clientIP]; ok {
-		if p.hostStillPresentLocked(h) {
+		if p.hostStillPresentLocked(h) && !p.hostFull(h) {
 			return h, true
 		}
-		// Stale - h was removed from the pool since this client was last
-		// assigned (see this field's own 2026-08-22 doc comment).
-		// removeHost should normally have already deleted this entry
-		// itself; this is the reactive backstop for anything that
-		// ordering might miss. Fall through to a fresh pick below rather
-		// than handing back a dead host.
-		log.Printf("[pool] client %s's assigned host %s is no longer in the pool, reassigning", clientIP, h.id)
+		// Stale - either h was removed from the pool since this client was
+		// last assigned (see this field's own 2026-08-22 doc comment), or
+		// h is now full (found live 2026-08-23: a client whose old session
+		// ended normally - not via warnAndKickLonelyPlayer's own
+		// clearAssignment, lobby/lonely-player-kick-design.md - keeps this
+		// entry forever; if two *other* real clients later fill that same
+		// host, every one of this client's own future reconnect attempts
+		// hit this cache and get routed straight back to a host that will
+		// only ever reject them, with no way to ever land anywhere else).
+		// removeHost should normally have already deleted a dead host's
+		// entries itself; this is the reactive backstop for anything that
+		// ordering might miss, plus the new full-host case. Fall through
+		// to a fresh pick below rather than handing back a host that can
+		// never actually admit this client.
+		log.Printf("[pool] client %s's assigned host %s is no longer usable (removed or full), reassigning", clientIP, h.id)
 		delete(p.assigned, clientIP)
 	}
 	h, ok := p.selectLocked(clientIP)

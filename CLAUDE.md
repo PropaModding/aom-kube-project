@@ -13,12 +13,28 @@ never-taken reference capture - see "Sessions are peer-to-peer" below),
 on-demand pod provisioning (see "Architecture intention" below),
 `host-health-probe-design.md`'s own "Explicitly out of scope" items
 (readiness/pool-membership gating in particular), `session-cleanup-design.md`'s
-optional Phase 4, host-selection priority still being plain round-robin
-rather than preferring an already-waiting host (see
-`lobby/lonely-player-kick-design.md`'s own "Not yet tested" section -
-untested with a pool larger than 2 hosts), and consolidation policy for
-3+ simultaneously-lonely hosts (that same doc - the sweep only acts on
-one pair per tick today).
+optional Phase 4, and consolidation policy for 3+ simultaneously-lonely
+hosts (`lobby/lonely-player-kick-design.md` - the sweep only acts on one
+pair per tick today).
+
+**Correction (2026-08-24)**: this file (in two places) and
+`lobby/lonely-player-kick-design.md`'s "Known limitation" section all
+described host selection as "plain round-robin, not preferring an
+already-waiting host" - wrong, and stale in a specific, findable way:
+`docs/multi-peer-routing-design.md`'s own "N-host round-robin
+matchmaking (2026-08-13)" section and `lobby/packet-handling-design.md`
+both correctly document that `hostPool.selectLocked`'s real 3-tier
+priority (prefer a host already waiting for a second player, then
+empty, then reject) was implemented the *same day* N-host support
+shipped, 2026-08-13 - `CLAUDE.md`'s own summary here just never got
+updated to match and stayed wrong for over a week, then got copied
+forward into a new doc without cross-checking the more detailed ones.
+Re-verified directly against the current code 2026-08-24: `if
+len(waiting) > 0 { ...return... }` always runs before `empty` is ever
+considered, unconditionally, regardless of how many hosts are in each
+tier - round-robin only breaks ties *within* one tier (which waiting
+host, if several), never causes a fallback to empty while a waiting one
+exists.
 
 - **`lobby/lonely-player-kick-design.md`**: two hosts each stuck with
   exactly one real client for over a minute now get consolidated - the
@@ -238,11 +254,17 @@ cluster's public address) — not LAN browsing. There is no pre-existing
   `aom-headless` pod dynamically via the Kubernetes API (read-only,
   `k8s/lobby-rbac.yaml`) and keeps a fully independent `pairRelay`/
   `matchState` per host, so `kubectl scale deployment/aom-headless
-  --replicas=N` is the entire "add a host" operation. **What's still
-  missing**: the actual selection *policy* (today it's plain round-robin,
-  not the "prefer a host already waiting for a second player" priority
-  `lobby/packet-handling-design.md` designs) - see that doc's "N-host
-  round-robin matchmaking" section.
+  --replicas=N` is the entire "add a host" operation. Selection *policy*
+  - `hostPool.selectLocked` - already implements the "prefer a host
+  already waiting for a second player" priority
+  `lobby/packet-handling-design.md` designs (a tiered scheme added
+  during the join-cushion work, 2026-08-22/23): any host with a real
+  client waiting for a second one is always preferred over an empty
+  host, unconditionally; round-robin only breaks ties within one tier.
+  **Correction (2026-08-24)**: this section previously described that
+  priority as "still missing, today it's plain round-robin" - stale,
+  re-verified directly against the current code (see the top of this
+  file for the fuller correction note).
 
 This is a substantial step up from the first working version (single
 always-on pod, static backend) — treat that version as the groundwork,
