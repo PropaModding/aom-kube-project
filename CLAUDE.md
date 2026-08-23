@@ -15,6 +15,31 @@ on-demand pod provisioning (see "Architecture intention" below),
 (readiness/pool-membership gating in particular), and
 `session-cleanup-design.md`'s optional Phase 4.
 
+- **`lobby/chat-injection-design.md`**: a real client landing in the
+  lobby now gets a spoofed, personalized welcome chat message
+  (`"Welcome, <name>!"`, falling back to an IP-based message if the name
+  isn't learned in time) - the first feature in this project to
+  synthesize new `0x03`-wrapped settings-sync content toward a real
+  client rather than only detect/forward/drop it. Landing signal is the
+  first backend→client `0x03` packet observed for the session
+  (`session.connIDKnown`'s own transition), not `isCDKeyEcho` (too
+  early, connection-layer only) or relay creation
+  (`isNewPeerBroadcast`/`isExistingPeerBroadcast`, which misses a lone
+  first arrival). Live-verified 2026-08-23, including a real bug caught
+  along the way - the first attempt's `seq` value jumped 1000 ahead of
+  the host's own real numbering and was silently never delivered
+  (classic DirectPlay's reliable-UDP ordering plausibly buffered it
+  forever waiting for packets that would never arrive) - fixed by
+  continuing the host's own numbering (`hostSeq+1`) instead. Player-name
+  personalization decodes a client's own player-announce message, based
+  on a single real sample (riskier than chat's five-sample decode) but
+  confirmed live against two independent real clients. Also resolves,
+  for practical purposes, this doc's own long-open "final 2 trailer
+  bytes" question from the chat-format decode: sent as `00 00`, rendered
+  fine - the client doesn't reject a message over it. See that doc's own
+  "Confirmed live"/"History" sections and
+  `archiving/sessions/20260823-welcome-message-chat-injection/` for the
+  evidence.
 - **`lobby/resign-burst-design.md`**: a player leaving the lobby/ready-up
   screen before a match starts now tears down their session/pairRelay
   within ~100ms instead of the 30s idle timeout - `isResignBurst` has
@@ -113,6 +138,8 @@ spoofing DirectPlay 8 packets to support modern multiplayer hosting environments
 - `lobby/packet-handling-design.md` — packet reference + durability design, companion to `main.go`. The no-eligible-host synthesis mystery and the P2P pairing mystery it once tracked are both resolved (see the `multi-peer-routing-design.md` entry above) - this doc's own packet-reference table has the byte-1 correction noted against every entry it affected.
 - `lobby/session-cleanup-design.md` — session/host lifecycle cleanup design, four related gaps found live 2026-08-20 tracing the bug that stuck a client on a deleted host pod forever (`hostPool.assigned` never revalidated, a removed host's `pairRelay`/`hostProbe` goroutines never torn down, its sessions never proactively closed). Phases 1-3 implemented and live-verified 2026-08-22.
 - `docs/host-health-probe-design.md` — design + implementation for `host-health-agent` (see above), which detects a silently-stuck `auto-host.sh` run and lets Kubernetes restart it automatically; implemented and live-verified 2026-08-22. Includes the packet-level evidence that the discovery exchange is client-initiated (no spontaneous host broadcast to passively observe).
+- `lobby/chat-injection-design.md` — reverse-engineered lobby chat message wire format (five real samples decoded) and player-announce/name decode (one real sample), `synthesizeChatMessage`, `isPlayerAnnounce`/`playerAnnounceName`, and the spoofed welcome-message feature built on top of them. Implemented and live-verified 2026-08-23 — see that doc's own "Confirmed live"/"History" sections. Feeds `lobby/lonely-player-kick-design.md`.
+- `lobby/lonely-player-kick-design.md` — design for auto-kicking a real client left alone at a host (no second real player), via a spoofed chat notice (now unblocked - see `chat-injection-design.md`, implemented) plus the already-calibrated `xdotool` kick coordinates from `docs/host-flow.md`. Design only, not yet implemented; slot-targeting and consolidation policy both still open.
 - `lobby/join-cushion-design.md` — design + implementation fixing two real clients connecting within a few seconds of each other (one gets permanently stuck "Attempting to Connect"). Root cause: a real host-engine race sending the first client a broadcast about the second built from a placeholder address, firing at session-port admission regardless of any pre-admission delay. Fixed by gating at the discovery port instead — `aom-lobby` withholds the discovery reply silently until the first client's own CD-key-check echo confirms it's genuinely connected, plus a short cooldown. Implemented and live-verified 2026-08-23.
 - `lobby/resign-burst-design.md` — design + implementation for near-instant teardown when a player leaves the lobby before a match starts (previously a 30s idle-timeout wait). `isResignBurst`'s own 3-byte wire signal is ambiguous with an unrelated periodic message (confirmed live 2026-08-11), so this gates on `matchState.hasStarted()` rather than the byte shape alone — a burst before match-start is acted on, after stays logged-only. In-match resign detection deliberately out of scope. Implemented and live-verified 2026-08-23, including a real teardown-races-the-packet bug caught and fixed along the way (`resignBurstDrain`).
 - `host-game-kube.sh` — the original hosting automation (EULA → menus → lobby, Players set to 3), driven externally via `kubectl exec`; superseded for routine use by `auto-host.sh` above, kept for manual/debug re-runs against a specific pod

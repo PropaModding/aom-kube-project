@@ -120,6 +120,20 @@ const (
 	// idleTimeout baseline this design replaces.
 	resignBurstDrain = 100 * time.Millisecond
 
+	// welcomeMessageDelay is how long to wait, after a client's session
+	// is confirmed genuinely in the lobby (see session.connIDKnown's
+	// "first backend->client 0x03-wrapped packet" landing signal, chosen
+	// over isCDKeyEcho/relay-creation - see lobby/chat-injection-design.md
+	// for why those are too early or too narrow), before sending the
+	// spoofed welcome chat message - extra margin on top of an
+	// already-genuine landing signal, not a substitute for one. Raised
+	// from 3s to 10s 2026-08-23 after the first live test showed no
+	// message despite a clean send (no socket error) - the actual bug
+	// found that same test was the seq value (see sendWelcomeMessage's
+	// own doc comment), so this widening is belt-and-suspenders, not a
+	// confirmed fix on its own.
+	welcomeMessageDelay = 10 * time.Second
+
 	// otherSessionPollTimeout/Interval bound pollOtherSessionClientAddr's
 	// retry loop - see that method's doc comment. 5s is generous relative
 	// to how close together both real clients' sessions were observed
@@ -630,6 +644,81 @@ func wrapperConnID(payload []byte) (id [2]byte, ok bool) {
 	return id, true
 }
 
+// wrapperSeq mirrors wrapperConnID, extracting the same 6-byte wrapper's
+// seq field instead - used to pick a synthesized message's own seq value
+// that won't collide with the real backend's own genuine future seq
+// values on this connection (see session.hostSeq's doc comment).
+func wrapperSeq(payload []byte) (seq uint16, ok bool) {
+	if len(payload) < 6 || payload[0] != 0x03 {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint16(payload[2:4]), true
+}
+
+// playerAnnounceGUIDLen is the fixed length of a player GUID as embedded
+// in a player-announce message: "{XXXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX}"
+// (38 chars) + a null terminator, ASCII - always this length regardless
+// of the player's own name length, since GUID string form is fixed.
+const playerAnnounceGUIDLen = 39
+
+// playerAnnounceNameLenOffset is the offset of the name field's own
+// declared-length byte within a player-announce message - see
+// isPlayerAnnounce/playerAnnounceName's shared doc comment for the full
+// layout this is based on.
+const playerAnnounceNameLenOffset = 8 + 6 + 3 + 1 + 2 + 7 + playerAnnounceGUIDLen // = 66
+
+// isPlayerAnnounce/playerAnnounceName decode a client's own self-
+// announcement of its player GUID + display name, sent client->host as
+// part of the real (non-simulated) handshake - see
+// lobby/chat-injection-design.md's "Player-reference hypothesis" section
+// for the one real sample this is built from (a 97-byte capture,
+// archiving/sessions/20260803-3v3-win-loss/session.pcap). Caveat, unlike
+// every other decoded message in this file: based on a SINGLE sample,
+// not cross-validated the way chat's five-sample decode was - real risk
+// this doesn't generalize (e.g. a longer/shorter name shifting anything
+// assumed fixed). Used best-effort for the welcome message's player name
+// (sendWelcomeMessage) - falls back to the client's IP if never observed
+// in time, not a hard dependency.
+//
+// Layout (offsets from the start of the 0x03-wrapped packet):
+//
+//	0-7    wrapper: 0x03, byte1, seq(2), connID(2), declared length(2)
+//	8-13   sub-header marker: 01 08 02 16 16 4e (fixed in the one sample seen)
+//	14-16  reserved (00 00 00 in the one sample seen)
+//	17     unexplained (0x24 in the one sample seen)
+//	18-19  unexplained (30 27 in the one sample seen)
+//	20-26  reserved (7 zero bytes)
+//	27-65  player GUID, ASCII string incl. braces + null (playerAnnounceGUIDLen bytes)
+//	66     declared length of the name field below, incl. its own null terminator
+//	67-73  reserved (7 zero bytes)
+//	74..   name, UTF-16LE, null-terminated, byte-66-declared-length long
+func isPlayerAnnounce(payload []byte) bool {
+	if len(payload) < 8+6 || payload[0] != 0x03 {
+		return false
+	}
+	return payload[8] == 0x01 && payload[9] == 0x08 && payload[10] == 0x02
+}
+
+func playerAnnounceName(payload []byte) (string, bool) {
+	if len(payload) < playerAnnounceNameLenOffset+1 {
+		return "", false
+	}
+	nameLen := int(payload[playerAnnounceNameLenOffset])
+	nameStart := playerAnnounceNameLenOffset + 1 + 7 // declared-length byte + 7 reserved bytes
+	if nameLen < 2 || nameStart+nameLen > len(payload) {
+		return "", false
+	}
+	nameBytes := payload[nameStart : nameStart+nameLen-2] // drop the trailing UTF-16 null terminator
+	if len(nameBytes) == 0 || len(nameBytes)%2 != 0 {
+		return "", false
+	}
+	u16 := make([]uint16, len(nameBytes)/2)
+	for i := range u16 {
+		u16[i] = binary.LittleEndian.Uint16(nameBytes[i*2 : i*2+2])
+	}
+	return string(utf16.Decode(u16)), true
+}
+
 // discoveryRewrite returns a copy of payload with the sin_port/sin_addr
 // fields of any embedded sockaddr_in blocks (per discoveryAddressOffsets)
 // replaced with the proxy's public address. sin_family and the still-
@@ -947,6 +1036,45 @@ func synthesizeNameBroadcast(connID [2]byte, seq uint16, name string) []byte {
 	out = binary.LittleEndian.AppendUint16(out, uint16(len(nameBytes)))
 	out = append(out, nameBytes...)
 	out = append(out, 0x00, 0x00) // trailer, matches the real capture
+	return out
+}
+
+// synthesizeChatMessage builds a fake 03-wrapped lobby chat message - see
+// lobby/chat-injection-design.md for the full decode (five real captures)
+// this is built from. Unlike synthesizeNameBroadcast's ASCII/UTF-8 name
+// field, chat text is UTF-16LE, confirmed independently across all five
+// samples. The final 2 trailer bytes are a genuinely open question (that
+// doc's "The open question" section - real checksums are ruled out, a
+// player-GUID reference is ruled out on size grounds, an ordering/counter
+// hypothesis remains untested) - sent as 00 00 here, per that doc's test
+// plan, to find out empirically whether the client even validates them.
+func synthesizeChatMessage(connID [2]byte, seq uint16, text string) []byte {
+	utf16Text := utf16.Encode([]rune(text))
+	strLen := len(utf16Text) + 1 // +1 for the null terminator
+	if strLen > 255 {
+		// byte 11 (the sub-header's string-length byte) is a single byte.
+		panic("synthesizeChatMessage: text too long for one packet")
+	}
+	stringBytes := make([]byte, strLen*2)
+	for i, r := range utf16Text {
+		binary.LittleEndian.PutUint16(stringBytes[i*2:], r)
+	}
+	// stringBytes[len(utf16Text)*2:] is already zero - the null terminator.
+
+	body := make([]byte, 0, 7+len(stringBytes))
+	body = append(body, 0x01, 0x47, 0x04, byte(strLen), 0x00, 0x00, 0x00)
+	body = append(body, stringBytes...)
+
+	declaredLen := uint16(len(body) + 4)
+
+	out := make([]byte, 0, 8+len(body)+6)
+	out = append(out, 0x03, 0x00) // byte1=0x00 arbitrary - unchecked field, same as every other message in this layer
+	out = binary.LittleEndian.AppendUint16(out, seq)
+	out = append(out, connID[:]...)
+	out = binary.LittleEndian.AppendUint16(out, declaredLen)
+	out = append(out, body...)
+	out = append(out, 0x00, 0x00, 0x00, 0x00) // fixed trailer prefix
+	out = append(out, 0x00, 0x00)             // trailer's open 2 bytes - see doc comment above
 	return out
 }
 
@@ -1942,6 +2070,29 @@ type session struct {
 	connID      [2]byte
 	connIDKnown bool
 
+	// hostSeq tracks the most recently observed seq value the backend has
+	// used on this same 0x03-wrapped settings-sync layer (wrapperSeq),
+	// updated on every such packet, not just the first - unlike connID,
+	// which is stable for the session, this genuinely moves. Used to pick
+	// a seq for a synthesized message (e.g. the welcome chat message, see
+	// sendWelcomeMessage) that continues the host's own real numbering
+	// (hostSeq+1) rather than jumping ahead of it - see
+	// sendWelcomeMessage's own doc comment for why a big jump is
+	// suspected to look like a gap of missing packets to the client's
+	// reliable-UDP ordering logic. Guarded by mu, same as connID.
+	hostSeq      uint16
+	hostSeqKnown bool
+
+	// playerName/playerNameKnown record this client's own display name,
+	// learned from its player-announce message if/when one is observed
+	// (see isPlayerAnnounce/playerAnnounceName's doc comment - based on a
+	// single real sample, best-effort). Used by sendWelcomeMessage to
+	// personalize the welcome text; falls back to the client's IP if
+	// never learned in time, not a hard dependency. Guarded by mu, same
+	// as connID/hostSeq.
+	playerName      string
+	playerNameKnown bool
+
 	// selfSinZero/selfSinZeroKnown record this client's own self-reported
 	// sin_zero tag (see docs/directplay8-protocol.md's "sin_zero" resolution -
 	// a per-participant identity tag each side generates once, which whoever
@@ -2688,6 +2839,22 @@ func (p *proxy) forwardToBackend(clientAddr *net.UDPAddr, payload []byte) {
 		p.pool.markFirstClientLanded(sess.host, clientAddr.IP.String())
 	}
 
+	// Learn this client's own display name, best-effort, for
+	// sendWelcomeMessage to personalize the welcome text with - see
+	// playerName's own doc comment for the single-sample caveat. Only
+	// meaningful on the session port, same as the CD-key-echo check
+	// above.
+	if p.name == "session" && isPlayerAnnounce(payload) {
+		if name, ok := playerAnnounceName(payload); ok {
+			sess.mu.Lock()
+			if !sess.playerNameKnown {
+				sess.playerName = name
+				sess.playerNameKnown = true
+			}
+			sess.mu.Unlock()
+		}
+	}
+
 	// Join cushion, closing the discovery-port gap (lobby/join-cushion-
 	// design.md): the check above only stops a *new* discovery session
 	// from being created against a cooling host - a session that started
@@ -3071,6 +3238,50 @@ func (p *proxy) simulateSessionPacket(clientAddr *net.UDPAddr, payload []byte) {
 	}
 }
 
+// sendWelcomeMessage schedules a spoofed welcome chat message
+// welcomeMessageDelay after clientAddr's session is confirmed genuinely
+// landed in the lobby (see backendToClient's own connIDKnown transition
+// for why that signal, not isCDKeyEcho or relay creation, was picked -
+// lobby/chat-injection-design.md has the full reasoning). The delay is
+// extra margin on top of an already-genuine landing signal, not a
+// substitute for one.
+func (p *proxy) sendWelcomeMessage(clientAddr *net.UDPAddr, connID [2]byte, sess *session) {
+	time.AfterFunc(welcomeMessageDelay, func() {
+		sess.mu.Lock()
+		// hostSeq+1, not some larger offset: classic DirectPlay is a
+		// reliable-UDP layer (sequencing+ACKs), so a seq that jumps far
+		// ahead of the host's own genuine numbering risks looking like a
+		// gap of missing packets to the client's own ordering/ack logic -
+		// plausibly buffered forever waiting for packets that will never
+		// arrive, never reaching the chat renderer at all, with zero
+		// visible symptom (no socket error, nothing). First live test
+		// (2026-08-23) used +1000 and sent cleanly but was never seen in
+		// the client's own chat log - this is the leading suspect, not
+		// yet confirmed. +1 mimics what the host's own actual next packet
+		// would use.
+		seq := sess.hostSeq + 1
+		name, nameKnown := sess.playerName, sess.playerNameKnown
+		sess.mu.Unlock()
+
+		// Personalized by name when it's been learned in time (see
+		// playerName's own doc comment - best-effort, single-sample
+		// decode), falling back to IP otherwise rather than blocking the
+		// message on it.
+		var text string
+		if nameKnown {
+			text = fmt.Sprintf("Welcome, %s!", name)
+		} else {
+			text = fmt.Sprintf("Welcome! Connected to %s.", clientAddr.IP.String())
+		}
+		msg := synthesizeChatMessage(connID, seq, text)
+		if _, err := p.clientConn.WriteToUDP(msg, clientAddr); err != nil {
+			log.Printf("[%s] write welcome chat message to client %s: %v", p.name, clientAddr, err)
+			return
+		}
+		log.Printf("[%s] sent welcome chat message to client %s (connID %x, seq %d): %q", p.name, clientAddr, connID, seq, text)
+	})
+}
+
 func (p *proxy) backendToClient(key string, clientAddr *net.UDPAddr, sess *session) {
 	buf := make([]byte, bufSize)
 	for {
@@ -3084,6 +3295,8 @@ func (p *proxy) backendToClient(key string, clientAddr *net.UDPAddr, sess *sessi
 
 		sess.mu.Lock()
 		sess.lastSeen = time.Now()
+		justLanded := false
+		var landedConnID [2]byte
 		if !sess.connIDKnown {
 			// Learned here, not in relayBackendInitiated: this read loop
 			// is scoped to sess's own per-client dialed backendConn, so
@@ -3091,12 +3304,33 @@ func (p *proxy) backendToClient(key string, clientAddr *net.UDPAddr, sess *sessi
 			// guesswork - see session.connID's doc comment and
 			// relayBackendInitiated's own doc comment for why this
 			// mapping matters.
+			//
+			// This transition (false->true, so only once per session) also
+			// doubles as the welcome-message "landed in lobby" signal - see
+			// welcomeMessageDelay's doc comment and
+			// lobby/chat-injection-design.md for why the first genuine
+			// backend->client 0x03-wrapped packet was chosen over
+			// isCDKeyEcho (a connection-layer echo, not proof the client's
+			// own lobby/chat UI is up) or relay creation
+			// (isNewPeerBroadcast/isExistingPeerBroadcast, which only fire
+			// once a second real client exists to pair with, missing a lone
+			// first arrival entirely).
 			if id, ok := wrapperConnID(payload); ok {
 				sess.connID = id
 				sess.connIDKnown = true
+				justLanded = true
+				landedConnID = id
 			}
 		}
+		if seq, ok := wrapperSeq(payload); ok {
+			sess.hostSeq = seq
+			sess.hostSeqKnown = true
+		}
 		sess.mu.Unlock()
+
+		if justLanded && p.name == "session" {
+			p.sendWelcomeMessage(clientAddr, landedConnID, sess)
+		}
 
 		if p.rewriteToClient != nil {
 			payload = p.rewriteToClient(payload, p.cfg, sess)
