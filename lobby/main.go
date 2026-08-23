@@ -72,6 +72,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -133,6 +134,16 @@ const (
 	// own doc comment), so this widening is belt-and-suspenders, not a
 	// confirmed fix on its own.
 	welcomeMessageDelay = 10 * time.Second
+
+	// lonelyPlayerSweepInterval/lonelyPlayerWaitThreshold/lonelyKickWarning
+	// - lobby/lonely-player-kick-design.md. A host counts as "lonely" once
+	// it's had exactly one real client for lonelyPlayerWaitThreshold; the
+	// sweep checks every lonelyPlayerSweepInterval, and once it acts on a
+	// pair of lonely hosts, the chosen client gets lonelyKickWarning
+	// (spoofed chat message, then an actual kick) before teardown.
+	lonelyPlayerSweepInterval = 10 * time.Second
+	lonelyPlayerWaitThreshold = 1 * time.Minute
+	lonelyKickWarning         = 15 * time.Second
 
 	// otherSessionPollTimeout/Interval bound pollOtherSessionClientAddr's
 	// retry loop - see that method's doc comment. 5s is generous relative
@@ -1263,6 +1274,16 @@ type hostCandidate struct {
 	// empty-tier branch), so a fresh "first client" always starts this
 	// cushion from a clean state too.
 	firstClientLandedAt time.Time
+
+	// lonelyKickInProgress guards sweepLonelyHosts against re-triggering
+	// a warn/kick sequence for a host that already has one running -
+	// the sweep runs every lonelyPlayerSweepInterval, shorter than the
+	// warn-then-kick sequence itself takes end to end. Guarded by
+	// hostPool.mu, same as every other hostCandidate field here. Cleared
+	// once warnAndKickLonelyPlayer's sequence finishes, whether it
+	// actually kicked or aborted because the host stopped being lonely
+	// on its own in the meantime.
+	lonelyKickInProgress bool
 }
 
 // hostPool tracks every known aom-headless backend. Replaces the old
@@ -1675,6 +1696,23 @@ func (p *hostPool) addHost(h *hostCandidate) {
 // documented in forwardToBackend's own 2026-08-14 correction - calling
 // into closeSessionsForHost, which takes a proxy's own p.mu, is safe in
 // this direction, not the reverse).
+// clearAssignment drops clientIP's sticky host assignment (hostPool.assigned),
+// if any - used by warnAndKickLonelyPlayer (lobby/lonely-player-kick-
+// design.md) so a kicked client's reconnect goes through selectLocked
+// fresh instead of landing right back on the host it was just kicked
+// from. Found live 2026-08-23: without this, assignForClient's own
+// sticky-per-IP cache (assignForClient's doc comment - deliberate, for
+// normal reconnect continuity) silently defeated the entire point of
+// kicking someone to consolidate them elsewhere, since their very next
+// reconnect was guaranteed to hit the cache and return the exact same
+// host, no different from every other client's own intentional
+// same-host rejoin behavior this cache exists to support.
+func (p *hostPool) clearAssignment(clientIP string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delete(p.assigned, clientIP)
+}
+
 func (p *hostPool) removeHost(id string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -2472,6 +2510,27 @@ func (p *proxy) sessionCountForHost(host *hostCandidate) int {
 		}
 	}
 	return n
+}
+
+// singleSessionForHost returns host's one real client session, if it
+// currently has exactly one - used by the lonely-player sweep
+// (sweepLonelyHosts/warnAndKickLonelyPlayer) to find who to warn/kick
+// and to re-check the host is still actually lonely right before acting.
+// ok is false for zero or more than one session, either of which means
+// host isn't lonely (anymore, or never was) - not an error case.
+func (p *proxy) singleSessionForHost(host *hostCandidate) (sess *session, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, s := range p.sessions {
+		if s.host != host {
+			continue
+		}
+		if sess != nil {
+			return nil, false
+		}
+		sess = s
+	}
+	return sess, sess != nil
 }
 
 // otherSessionClientAddr returns the real address of the one session in
@@ -3401,6 +3460,138 @@ func (p *proxy) reapIdleSessions() {
 	}
 }
 
+// sweepLonelyHosts (lobby/lonely-player-kick-design.md) periodically
+// looks for two or more hosts that have each been sitting with exactly
+// one real client for lonelyPlayerWaitThreshold - two wasted, half-full
+// games that could be consolidated into one real match. When found, it
+// warns the *younger* of them (whichever became lonely more recently -
+// hostCandidate.firstClientJoinedAt, already tracked for the join-cushion
+// work and equally valid here as a "lonely since" clock, since it's
+// re-stamped exactly when a host goes from zero real clients to its
+// current one) and hands off to warnAndKickLonelyPlayer for the rest.
+//
+// Sessions/session-port only: same reasoning as sessionCountForHost
+// itself - discoveryProxy's own sessions are ephemeral per-query
+// traffic, not real occupancy.
+//
+// Known limitation, not fixed by this pass: host *selection* on
+// reconnect is still plain round-robin (CLAUDE.md's "N-host round-robin
+// matchmaking" section, still open) - nothing here guarantees the kicked
+// client's reconnect actually lands back on the specific older host this
+// sweep had in mind, only that it re-enters matchmaking. With a small
+// pool this usually works out in practice, and a later sweep tick will
+// catch it again if not - a best-effort consolidation, not a guaranteed
+// one.
+func (p *proxy) sweepLonelyHosts() {
+	ticker := time.NewTicker(lonelyPlayerSweepInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		p.pool.mu.Lock()
+		var lonely []*hostCandidate
+		for _, h := range p.pool.hosts {
+			if h.lonelyKickInProgress {
+				continue
+			}
+			if h.firstClientJoinedAt.IsZero() || time.Since(h.firstClientJoinedAt) < lonelyPlayerWaitThreshold {
+				continue
+			}
+			if p.sessionCountForHost(h) != 1 {
+				continue
+			}
+			lonely = append(lonely, h)
+		}
+		if len(lonely) < 2 {
+			p.pool.mu.Unlock()
+			continue
+		}
+		sort.Slice(lonely, func(i, j int) bool {
+			return lonely[i].firstClientJoinedAt.After(lonely[j].firstClientJoinedAt)
+		})
+		youngest := lonely[0]
+		youngest.lonelyKickInProgress = true
+		p.pool.mu.Unlock()
+
+		go p.warnAndKickLonelyPlayer(youngest)
+	}
+}
+
+// warnAndKickLonelyPlayer sends host's current sole client a spoofed
+// chat warning, waits lonelyKickWarning, re-checks host is still
+// actually lonely (a second real client may have joined, or the first
+// one may have already left, on its own during the wait - either way
+// there's nothing to kick), then clicks both kick-icon slots
+// (lonelyKickSlot2X/Y, lonelyKickSlot3X/Y - see their own doc comment
+// for why both rather than figuring out which one) and explicitly tears
+// the session/pair relay down - not relying on the in-game kick's own
+// network effect alone to eventually surface as a read error
+// (lobby/resign-burst-design.md already established explicit,
+// deterministic teardown over hoping a passive side effect catches it
+// promptly).
+//
+// Always clears host.lonelyKickInProgress on the way out, whether it
+// actually kicked or aborted early - otherwise this host could never be
+// swept again.
+func (p *proxy) warnAndKickLonelyPlayer(host *hostCandidate) {
+	defer func() {
+		p.pool.mu.Lock()
+		host.lonelyKickInProgress = false
+		p.pool.mu.Unlock()
+	}()
+
+	sess, ok := p.singleSessionForHost(host)
+	if !ok {
+		log.Printf("[lonely] %s: no longer has exactly one real client, aborting", host.id)
+		return
+	}
+	clientAddr := sess.clientAddr
+
+	sess.mu.Lock()
+	connID, connIDKnown := sess.connID, sess.connIDKnown
+	seq := sess.hostSeq + 1
+	sess.mu.Unlock()
+	if !connIDKnown {
+		log.Printf("[lonely] %s: client %s connID not known yet, aborting", host.id, clientAddr)
+		return
+	}
+
+	text := fmt.Sprintf("There is another game with a player waiting, Please connect to TheIP again, you will be removed from this game in %d seconds", int(lonelyKickWarning.Seconds()))
+	msg := synthesizeChatMessage(connID, seq, text)
+	if _, err := p.clientConn.WriteToUDP(msg, clientAddr); err != nil {
+		log.Printf("[lonely] %s: write warning to client %s: %v", host.id, clientAddr, err)
+		return
+	}
+	log.Printf("[lonely] %s: warned client %s (%q), kicking in %s", host.id, clientAddr, text, lonelyKickWarning)
+
+	time.Sleep(lonelyKickWarning)
+
+	sess, ok = p.singleSessionForHost(host)
+	if !ok || sess.clientAddr.String() != clientAddr.String() {
+		log.Printf("[lonely] %s: no longer lonely (or a different client now), aborting kick", host.id)
+		return
+	}
+
+	for _, xy := range [2][2]int{{lonelyKickSlot2X, lonelyKickSlot2Y}, {lonelyKickSlot3X, lonelyKickSlot3Y}} {
+		url := fmt.Sprintf("http://%s/click?x=%d&y=%d", host.inputAgentAddr, xy[0], xy[1])
+		resp, err := http.Post(url, "", nil)
+		if err != nil {
+			log.Printf("[lonely] %s: POST %s: %v", host.id, url, err)
+			continue
+		}
+		resp.Body.Close()
+	}
+	log.Printf("[lonely] %s: kicked both slots, tearing down client %s", host.id, clientAddr)
+
+	host.match.onClientGone(clientAddr)
+	// Close triggers backendToClient's own read-error cleanup path - the
+	// same teardown every other departure already goes through.
+	sess.backendConn.Close()
+	// Without this, the kicked client's next reconnect would hit
+	// assignForClient's own sticky cache and land right back on this same
+	// host - see clearAssignment's own doc comment for the live bug this
+	// fixes.
+	p.pool.clearAssignment(clientAddr.IP.String())
+}
+
 func mustListen(addr string) *net.UDPConn {
 	udpAddr, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -3900,6 +4091,23 @@ const (
 	hostReadyY = 89
 )
 
+// lonelyKickSlot2X/Y and lonelyKickSlot3X/Y are the two lobby slots' own
+// kick-icon coordinates, pixel-measured live and confirmed working
+// against a real connected client (docs/host-flow.md). This project
+// only ever hosts 1v1s (host + 2 real slots, maxRealClientsPerHost), so
+// a lonely host's one real client is in whichever of these two isn't
+// AI-filled or empty - rather than track which one that actually is
+// (lobby/lonely-player-kick-design.md's own still-open "one real
+// unknown"), warnAndKickLonelyPlayer clicks both: kicking an AI or empty
+// slot is harmless, and this reliably catches the real client either
+// way.
+const (
+	lonelyKickSlot2X = 37
+	lonelyKickSlot2Y = 115
+	lonelyKickSlot3X = 37
+	lonelyKickSlot3Y = 143
+)
+
 // setReady records a real client's latest Ready-toggle state (see
 // isReadyToggle/readyToggleState) and reports whether both real clients
 // are now ready - "both" meaning exactly 2 distinct clients have ever
@@ -4331,6 +4539,7 @@ func main() {
 
 	go discoveryProxy.reapIdleSessions()
 	go sessionProxy.reapIdleSessions()
+	go sessionProxy.sweepLonelyHosts()
 	go discoveryProxy.run()
 	sessionProxy.run()
 }

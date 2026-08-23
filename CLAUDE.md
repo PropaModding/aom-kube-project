@@ -1,6 +1,6 @@
 # AoM Kube Project
 
-## Recently closed (2026-08-23)
+## Recently closed (2026-08-24)
 No open top-priority item as of this writing. Remaining backlog, none
 currently prioritized: Voobly client support (see "Dual client-variant
 support" below), **in-match** resign detection (see
@@ -12,9 +12,29 @@ from the client→host `isResignBurst` work below, blocked on a
 never-taken reference capture - see "Sessions are peer-to-peer" below),
 on-demand pod provisioning (see "Architecture intention" below),
 `host-health-probe-design.md`'s own "Explicitly out of scope" items
-(readiness/pool-membership gating in particular), and
-`session-cleanup-design.md`'s optional Phase 4.
+(readiness/pool-membership gating in particular), `session-cleanup-design.md`'s
+optional Phase 4, host-selection priority still being plain round-robin
+rather than preferring an already-waiting host (see
+`lobby/lonely-player-kick-design.md`'s own "Not yet tested" section -
+untested with a pool larger than 2 hosts), and consolidation policy for
+3+ simultaneously-lonely hosts (that same doc - the sweep only acts on
+one pair per tick today).
 
+- **`lobby/lonely-player-kick-design.md`**: two hosts each stuck with
+  exactly one real client for over a minute now get consolidated - the
+  younger lonely host's client gets a spoofed chat warning, a 15s
+  countdown, a kick (both lobby slots clicked, sidestepping the
+  still-open "which slot" question entirely), and explicit teardown.
+  Live-verified 2026-08-23/24, including a real bug caught along the
+  way: the kicked client's reconnect initially landed right back on the
+  same host it was kicked from, because nothing cleared
+  `hostPool.assigned`'s sticky per-client-IP cache (built for normal
+  reconnect continuity, not accounted for here) - fixed with
+  `hostPool.clearAssignment`. Confirmed working after the fix: the
+  kicked client's reconnect landed on the *other* lonely host and formed
+  a real match with it. See that doc's own "Confirmed live"/"History"
+  sections and `archiving/sessions/20260823-lonely-player-kick/` for the
+  evidence.
 - **`lobby/chat-injection-design.md`**: a real client landing in the
   lobby now gets a spoofed, personalized welcome chat message
   (`"Welcome, <name>!"`, falling back to an IP-based message if the name
@@ -139,7 +159,7 @@ spoofing DirectPlay 8 packets to support modern multiplayer hosting environments
 - `lobby/session-cleanup-design.md` — session/host lifecycle cleanup design, four related gaps found live 2026-08-20 tracing the bug that stuck a client on a deleted host pod forever (`hostPool.assigned` never revalidated, a removed host's `pairRelay`/`hostProbe` goroutines never torn down, its sessions never proactively closed). Phases 1-3 implemented and live-verified 2026-08-22.
 - `docs/host-health-probe-design.md` — design + implementation for `host-health-agent` (see above), which detects a silently-stuck `auto-host.sh` run and lets Kubernetes restart it automatically; implemented and live-verified 2026-08-22. Includes the packet-level evidence that the discovery exchange is client-initiated (no spontaneous host broadcast to passively observe).
 - `lobby/chat-injection-design.md` — reverse-engineered lobby chat message wire format (five real samples decoded) and player-announce/name decode (one real sample), `synthesizeChatMessage`, `isPlayerAnnounce`/`playerAnnounceName`, and the spoofed welcome-message feature built on top of them. Implemented and live-verified 2026-08-23 — see that doc's own "Confirmed live"/"History" sections. Feeds `lobby/lonely-player-kick-design.md`.
-- `lobby/lonely-player-kick-design.md` — design for auto-kicking a real client left alone at a host (no second real player), via a spoofed chat notice (now unblocked - see `chat-injection-design.md`, implemented) plus the already-calibrated `xdotool` kick coordinates from `docs/host-flow.md`. Design only, not yet implemented; slot-targeting and consolidation policy both still open.
+- `lobby/lonely-player-kick-design.md` — auto-kicks a real client left alone at a host once two hosts have each been lonely for over a minute, via a spoofed chat warning (`chat-injection-design.md`'s `synthesizeChatMessage`) plus the already-calibrated `xdotool` kick coordinates from `docs/host-flow.md` (both lobby slots clicked, sidestepping slot-targeting entirely). Implemented and live-verified 2026-08-23/24 — see that doc's own "Confirmed live"/"History" sections. 3+ simultaneously-lonely hosts and a larger-pool test both still open.
 - `lobby/join-cushion-design.md` — design + implementation fixing two real clients connecting within a few seconds of each other (one gets permanently stuck "Attempting to Connect"). Root cause: a real host-engine race sending the first client a broadcast about the second built from a placeholder address, firing at session-port admission regardless of any pre-admission delay. Fixed by gating at the discovery port instead — `aom-lobby` withholds the discovery reply silently until the first client's own CD-key-check echo confirms it's genuinely connected, plus a short cooldown. Implemented and live-verified 2026-08-23.
 - `lobby/resign-burst-design.md` — design + implementation for near-instant teardown when a player leaves the lobby before a match starts (previously a 30s idle-timeout wait). `isResignBurst`'s own 3-byte wire signal is ambiguous with an unrelated periodic message (confirmed live 2026-08-11), so this gates on `matchState.hasStarted()` rather than the byte shape alone — a burst before match-start is acted on, after stays logged-only. In-match resign detection deliberately out of scope. Implemented and live-verified 2026-08-23, including a real teardown-races-the-packet bug caught and fixed along the way (`resignBurstDrain`).
 - `host-game-kube.sh` — the original hosting automation (EULA → menus → lobby, Players set to 3), driven externally via `kubectl exec`; superseded for routine use by `auto-host.sh` above, kept for manual/debug re-runs against a specific pod
