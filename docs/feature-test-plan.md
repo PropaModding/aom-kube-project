@@ -1,8 +1,12 @@
-# Feature test plan (as of 2026-08-22)
+# Feature test plan (as of 2026-08-23)
 
-A structured pass over every feature this project currently implements,
-written after the 2026-08-20 byte-1 detection fix and N-host/LAN-
-sanitization commit. Each section names what's being verified, the
+A structured pass over every feature this project currently implements.
+Originally written after the 2026-08-20 byte-1 detection fix and N-host/
+LAN-sanitization commit; updated 2026-08-23 to add coverage for four
+features shipped since (session/host lifecycle cleanup, `host-health-
+agent` self-healing, the join cushion, and pre-match resign detection -
+sections K, L, M, N) and to fix sections C6/G/K, which described bugs or
+gaps that are now closed. Each section names what's being verified, the
 concrete setup/steps, the expected result, and exactly how to check it -
 reusing the specific tools and techniques this project has already
 proven out (VNC/`vncdotool`, `tshark`/node-level `tcpdump`, the status
@@ -108,16 +112,15 @@ already assigned to a host, have it quit to menu and rejoin (same
 container, same IP). Expect: lands back on the *same* host, not
 re-round-robined elsewhere.
 
-**C6 - stale assignment after host removal (currently fails - see
-`lobby/session-cleanup-design.md`'s Gap 1)**: with a client assigned to
-host A, delete host A's pod (`kubectl delete pod <host-A>`) while a
-fresh host B exists. Have the same client reconnect. **Expected once
-Phase 1 of the cleanup design ships**: routed to host B. **Actual
-today**: the client's session-port traffic keeps dialing the now-dead
-host A indefinitely (`dial udp ...: connect: invalid argument` repeating
-in the log) until `aom-lobby` itself is restarted. Run this test to
-confirm the bug is still present before Phase 1 lands, and to confirm
-it's fixed once it does.
+**C6 - stale assignment after host removal (fixed 2026-08-22 - see
+`lobby/session-cleanup-design.md`'s Gap 1/Phase 1)**: with a client
+assigned to host A, delete host A's pod (`kubectl delete pod <host-A>`)
+while a fresh host B exists. Have the same client reconnect. **Expected**:
+routed to host B - `hostPool.assigned`'s stale entry gets proactively
+deleted by `removeHost` (and reactively re-validated by
+`assignForClient` as a backstop either way), so the client's session-port
+traffic never dials the dead host at all. Duplicate of section K4 below;
+kept here too since it's naturally part of the N-host pool walkthrough.
 
 ---
 
@@ -219,12 +222,16 @@ until [ "$(curl -s $(minikube ip):8080/hosts)" = "1" ]; do sleep 10; done
 **Verify**: `kubectl logs <new-pod>` shows the full click sequence
 completing (`EULA` through `kick slot 3 AI`) with no gaps; a VNC
 screenshot at that point shows the in-lobby screen with `Players: 3`,
-Observer Mode set, both non-host slots `Open`. **Known flakiness**:
-today's session hit one run where the automated sequence silently
-misclicked (landed on the wrong screen) despite reporting success in its
-own log - if `/hosts` doesn't flip within the expected window, check a
-VNC screenshot before assuming a code bug; a clean pod recreation
-usually resolves it.
+Observer Mode set, both non-host slots `Open`. **Known flakiness, now
+self-healing (see section L)**: this sequence can still silently
+misclick (land on the wrong screen) despite reporting success in its own
+log - as of `host-health-agent` (2026-08-22), this no longer needs manual
+diagnosis: if `/hosts` doesn't flip within the expected window, give it
+~100s (`livenessProbe`'s `initialDelaySeconds`) and check
+`kubectl get pod <new-pod>` for `RESTARTS` incrementing - Kubernetes
+should restart the pod automatically and it should re-run `auto-host.sh`
+on its own. Only fall back to a manual VNC screenshot/pod recreation if
+that doesn't happen, which would itself be a regression in section L.
 
 ---
 
@@ -292,29 +299,157 @@ welcome to browse in."
 
 ---
 
-## K. Session/host lifecycle cleanup (not yet implemented - planned tests)
+## K. Session/host lifecycle cleanup (implemented and live-verified 2026-08-22)
 
-These are written against `lobby/session-cleanup-design.md`'s own
-"Verifying the fix" section, listed here so this test plan stays
-complete once that design ships. **All of K1-K4 are expected to fail or
-be not-yet-applicable today** - re-run once Phases 1-3 of that design
-are implemented.
+Written against `lobby/session-cleanup-design.md`'s own "Verifying the
+fix" section. Phases 1-3 shipped 2026-08-22; K1-K4 below are all
+expected to **pass** today (see that doc's own "Confirmed live,
+2026-08-22" section for the original trace). Phase 4 (bounding
+`hostPool.assigned`'s long-run growth) is optional and unimplemented -
+not covered here, not blocking.
 
 **K1**: scale to 2 hosts, pair two real clients on one, delete that
-host's pod mid-match. Expect (post-fix): affected clients' sessions
-close within seconds, not the 30s idle window.
+host's pod mid-match. Expect: affected clients' sessions close within
+seconds (`[session] closing session for client ... (host ... removed)`
+in the log), not the 30s idle window.
 
-**K2**: same setup - confirm the `pairRelay` goroutine actually exits
-(no longer present in a `pprof` goroutine dump, or a log line confirming
-`relay.conn.Close()` fired).
+**K2**: same setup - confirm the `pairRelay` goroutine actually exits:
+`[match] ... departed, tearing down pair relay` followed by
+`[pair] read: ... use of closed network connection (relay stopping)` in
+the log (no longer present in a `pprof` goroutine dump if you want to
+confirm at that level too).
 
 **K3**: repeatedly scale a host count up and down several times: confirm
-the `hostProbe` goroutine count doesn't grow across the churn (currently
-leaks one per removed host, unconditionally).
+the `hostProbe` goroutine count doesn't grow across the churn -
+`removeHost` now calls `stopProbe()` on every removal.
 
-**K4**: after K1's pod deletion, reconnect the same client IPs. Expect
-(post-fix): routed to the surviving host. This is the same scenario as
-section C's C6 - once Phase 1 ships, C6 and K4 should both pass.
+**K4**: after K1's pod deletion, reconnect the same client IPs. Expect:
+routed to the surviving host, confirmed via a healthy `[pair] relaying`
+exchange forming on the new host with no stuck reference to the deleted
+one. Same scenario as section C's C6.
+
+---
+
+## L. Host self-healing (`host-health-agent`, implemented and live-verified 2026-08-22)
+
+**What**: a pod whose `auto-host.sh` run silently got stuck (misclicked
+onto the wrong menu, never reached the hosted lobby, but still logged
+"done" and exited 0) gets detected and restarted automatically, without
+needing anyone to notice `/hosts` undercounting and manually delete it.
+
+**Setup**: one healthy, already-hosting `aom-headless` pod.
+
+**Steps**: simulate a stuck pod *without* actually killing its main
+process (killing it tests ordinary `restartPolicy: Always` crash
+recovery, not this feature - see `host-health-probe-design.md`'s own
+"Confirmed live" section for why that distinction matters):
+
+```bash
+kubectl exec <pod> -- ps -eo pid,cmd | grep aomxnocd1.exe   # find the real PID, not tini's PID 1
+kubectl exec <pod> -- kill -STOP <that PID>                  # pauses it, doesn't kill it
+```
+
+**Expected**: within `initialDelaySeconds` (100s) + up to
+`failureThreshold * periodSeconds` (30s), Kubernetes restarts the
+container - `RESTARTS` increments on `kubectl get pod <pod>` - and the
+pod runs a fresh `auto-host.sh` cycle, re-hosting successfully.
+
+**Verify**:
+- `curl $(minikube ip):8090/host-health?id=<pod-name>` - should read
+  `503` while paused, `200` again once the fresh cycle completes.
+- `kubectl get events --field-selector involvedObject.name=<pod>` -
+  confirm `Warning Unhealthy: Liveness probe failed` followed by
+  `Normal Killing: Container aom failed liveness probe, will be
+  restarted`, attributing the restart to this specific probe chain (not
+  some other cause).
+- **Fail-open check**: with a healthy pod running, stop/block
+  `host-health-agent` (e.g. scale its DaemonSet's node count to 0, or
+  block port 8090) and confirm the healthy pod's own liveness probe
+  keeps passing rather than restarting - `healthcheck.sh` should fail
+  open (exit 0) on anything but an explicit `503`.
+
+---
+
+## M. Join cushion - two clients connecting close together (implemented and live-verified 2026-08-23)
+
+**What**: two real clients connecting within a few seconds of each other
+used to leave one of them permanently stuck on "Attempting to Connect" -
+a real host-engine race sending the first client a broadcast about the
+second built from a placeholder address (`0.0.0.0:0`). Fixed by
+withholding the second client's discovery reply until the first client's
+own CD-key echo confirms it's genuinely connected, plus a short cooldown
+- see `lobby/join-cushion-design.md` for the full evidence trail (five
+live tests were needed to find the actual fix).
+
+**Setup**: one empty, freshly-hosted pod (single-host pool for the
+cleanest repro).
+
+**Steps**: launch two spoofed clients and Direct-Connect both within
+~1-2 seconds of each other.
+
+**Expected**: client A connects normally. Client B's game window stays
+on "Attempting to Connect"/LAN-lobby screen, visibly retrying on its
+own, with **no error shown** (not "lobby full," not any rejection) -
+then connects normally once the first client's CD-key echo + cooldown
+clears, and both pair up correctly.
+
+**Verify**:
+- `grep 'still cooling down' <lobby-log>` - confirm repeated silent
+  withholding entries for client B, then nothing further once admitted.
+- `grep 'rewrote 0x29 new-peer broadcast' <lobby-log>` - confirm the
+  embedded address is real (client B's actual IP:port), never
+  `0.0.0.0:0` - this is the actual regression check; if this line
+  reappears with a zero address, the race is back.
+- `grep '\[pair\] relaying' <lobby-log> | tail -20` - confirm genuinely
+  bidirectional traffic (both `A -> B` and `B -> A` lines with real
+  content), not the one-directional silence that was this bug's own
+  signature before the fix.
+- **Multi-host check**: with 2 hosts scaled up, confirm a genuinely
+  *different*, unrelated third client still lands on the empty second
+  host immediately, with no cushion delay at all - the cushion should be
+  invisible to a client not involved in the close-together pairing.
+
+---
+
+## N. Resign burst - pre-match departure detection (implemented and live-verified 2026-08-23)
+
+**What**: a player leaving the lobby/ready-up screen *before* a match
+starts now frees their host slot within ~100ms instead of the 30-40s
+idle-timeout wait. **In-match resign detection is explicitly out of
+scope** - a burst seen after `matchState.hasStarted()` stays logged-only,
+same as before this feature, since the known 2026-08-11 periodic false
+positive (identical byte shape, no real departure, fires every 2 minutes
+during active gameplay) is still unsolved for that case. See
+`lobby/resign-burst-design.md` for the full evidence trail, including
+two real bugs (a silence-based approach that didn't work for this case,
+then a teardown that raced ahead of the packet it was reacting to)
+caught and fixed live before this worked correctly.
+
+**N1 - pre-match leave**: two real clients pair in the lobby. Before
+either readies up, one leaves the lobby menu. Expect: session/relay tear
+down within ~100ms (`resignBurstDrain`), and - check this on the
+*surviving* client's own screen, not just the backend log, since that's
+exactly what the first live test of this feature got wrong - the
+departed player disappears from its player list promptly.
+
+**N2 - in-match burst, left alone (regression check)**: let a real
+2-client match actually start (both ready up) and run past the 2-minute
+mark. Expect: the periodic burst is detected and logged as `in-match
+(not acted on...)`, and critically, **nothing gets torn down** - this is
+the exact check that would have caught the 2026-08-11 regression before
+it shipped, and must keep passing every time this code changes.
+
+**Verify**:
+- `grep 'resign-shaped burst' <lobby-log>` - N1 should show exactly one
+  `pre-match, tearing down in 100ms` line (not ten - confirms the
+  `resignCheckPending` debounce), followed by `[match] ... departed,
+  tearing down pair relay`. N2 should show `in-match (not acted on...)`
+  repeating every ~2 minutes with no teardown ever following it.
+- Packet-count check on the drain window (N1 specifically): confirm all
+  ten copies of the burst (`client->backend non-handshake (3 bytes):
+  01<connID>`) appear in the log before the teardown line - if fewer
+  than ten show up, `resignBurstDrain` may be too short relative to
+  current network conditions.
 
 ---
 
@@ -328,3 +463,9 @@ section C's C6 - once Phase 1 ships, C6 and K4 should both pass.
   - this project's scope has never required a match to run past
   ready-up; the protocol for that layer is largely undecoded (see the
   reverse-engineering backlog doc's Tier 2).
+- **In-match resign detection** - no implementation exists yet; section
+  N above covers only the pre-match case. See
+  `lobby/resign-burst-design.md`'s "What's explicitly deferred" section.
+- **`isHostResignNotice`** (a fast host→client departure signal, distinct
+  from section N's client→host detection) - blocked on a reference
+  capture that's never been taken; nothing to test yet.
