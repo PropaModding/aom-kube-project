@@ -1,17 +1,35 @@
 # AoM Kube Project
 
-## Recently closed (2026-08-22)
-Both items that had been the top priority through this date are now
-**implemented and fully live-verified** - no open top-priority item as
-of this writing. Remaining backlog, none currently prioritized: Voobly
-client support (see "Dual client-variant support" below), fast
-client-departure detection (`isHostResignNotice`, blocked on a never-
-taken reference capture - see "Sessions are peer-to-peer" below), on-
-demand pod provisioning (see "Architecture intention" below),
-`host-health-probe-design.md`'s own "Explicitly out of scope" items
-(readiness/pool-membership gating in particular), and
+## Recently closed (2026-08-23)
+No open top-priority item as of this writing. Remaining backlog, none
+currently prioritized: Voobly client support (see "Dual client-variant
+support" below), fast client-departure detection (`isHostResignNotice`,
+blocked on a never-taken reference capture - see "Sessions are
+peer-to-peer" below), on-demand pod provisioning (see "Architecture
+intention" below), `host-health-probe-design.md`'s own "Explicitly out
+of scope" items (readiness/pool-membership gating in particular), and
 `session-cleanup-design.md`'s optional Phase 4.
 
+- **`lobby/join-cushion-design.md`**: closes the two-clients-connecting-
+  close-together bug (one gets permanently stuck on "Attempting to
+  Connect") found live 2026-08-22 while testing the items below. Root
+  cause: the real host's own "new peer" broadcast to the first client,
+  announcing the second, is built from a placeholder address
+  (`0.0.0.0:0`) instead of the second client's real one - a race inside
+  the host's own engine at session-port admission, confirmed insensitive
+  to any pre-admission delay. Fixed not by waiting longer but by never
+  letting a second client *reach* session-port admission until the first
+  has genuinely finished connecting: `discoveryProxy` now makes the real,
+  sticky matchmaking decision (not just a non-committing peek), and
+  withholds the discovery reply entirely - silently, so the client just
+  keeps retrying from its own LAN-lobby screen - until the first client's
+  own CD-key-check echo (the one confirmed client→host round-trip in the
+  whole handshake) is observed, plus a short cooldown after it. A flat
+  pre-completion timer stays only as a fallback ceiling. Live-verified
+  2026-08-23 - see that doc's own "Confirmed live" section, including two
+  real bugs caught and fixed along the way (a host claimed at discovery
+  time still looking "empty" to a concurrent second client's own ping,
+  and a stale zombie test client winning a race after a lobby restart).
 - **`lobby/session-cleanup-design.md`** (Phases 1-3): deleted a host pod
   mid-match under an actual formed, actively-relaying pair and confirmed
   all four gaps close correctly - immediate host-removal detection,
@@ -75,6 +93,7 @@ spoofing DirectPlay 8 packets to support modern multiplayer hosting environments
 - `lobby/packet-handling-design.md` — packet reference + durability design, companion to `main.go`. The no-eligible-host synthesis mystery and the P2P pairing mystery it once tracked are both resolved (see the `multi-peer-routing-design.md` entry above) - this doc's own packet-reference table has the byte-1 correction noted against every entry it affected.
 - `lobby/session-cleanup-design.md` — session/host lifecycle cleanup design, four related gaps found live 2026-08-20 tracing the bug that stuck a client on a deleted host pod forever (`hostPool.assigned` never revalidated, a removed host's `pairRelay`/`hostProbe` goroutines never torn down, its sessions never proactively closed). Phases 1-3 implemented and live-verified 2026-08-22.
 - `docs/host-health-probe-design.md` — design + implementation for `host-health-agent` (see above), which detects a silently-stuck `auto-host.sh` run and lets Kubernetes restart it automatically; implemented and live-verified 2026-08-22. Includes the packet-level evidence that the discovery exchange is client-initiated (no spontaneous host broadcast to passively observe).
+- `lobby/join-cushion-design.md` — design + implementation fixing two real clients connecting within a few seconds of each other (one gets permanently stuck "Attempting to Connect"). Root cause: a real host-engine race sending the first client a broadcast about the second built from a placeholder address, firing at session-port admission regardless of any pre-admission delay. Fixed by gating at the discovery port instead — `aom-lobby` withholds the discovery reply silently until the first client's own CD-key-check echo confirms it's genuinely connected, plus a short cooldown. Implemented and live-verified 2026-08-23.
 - `host-game-kube.sh` — the original hosting automation (EULA → menus → lobby, Players set to 3), driven externally via `kubectl exec`; superseded for routine use by `auto-host.sh` above, kept for manual/debug re-runs against a specific pod
 - `run-aom-spoofed-client.sh` — one "second PC" container for testing Direct-Connect against the cluster
 - `run-aom-verbose-clients.sh` — two spoofed clients (host + 1 joiner) joining directly (no lobby/proxy), with full WINEDEBUG + in-container tcpdump byte capture, for diffing a genuinely successful connection against a failing proxied one

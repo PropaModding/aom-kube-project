@@ -89,6 +89,23 @@ const (
 	probeInterval = 3 * time.Second
 	probeTimeout  = 1 * time.Second
 
+	// joinCushion is the fallback ceiling a host's first real client gets
+	// before a second one is admitted, measured from *assignment* (not
+	// completion) - see lobby/join-cushion-design.md. Only actually
+	// controls admission if firstClientLandedAt is never set (the CD-key
+	// echo somehow never observed); the normal case is postLandCooldown
+	// below. A starting value, not yet measured against a real capture of
+	// AoM's own host-side join handshake settling time (see that doc's
+	// "Tuning" section).
+	joinCushion = 5 * time.Second
+
+	// postLandCooldown is how long a host's first real client gets
+	// *after* its own CD-key echo is observed (isCDKeyEcho) before a
+	// second client is admitted - the normal-case gate, event-driven
+	// rather than a blind guess from assignment time. Same starting-value
+	// caveat as joinCushion above.
+	postLandCooldown = 5 * time.Second
+
 	// otherSessionPollTimeout/Interval bound pollOtherSessionClientAddr's
 	// retry loop - see that method's doc comment. 5s is generous relative
 	// to how close together both real clients' sessions were observed
@@ -257,6 +274,40 @@ func isNewPeerBroadcast(payload []byte) bool {
 	}
 	return payload[0] == newPeerWrapperType0 &&
 		payload[newPeerSubTypeOffset] == newPeerSubType0 && payload[newPeerSubTypeOffset+1] == newPeerSubType1
+}
+
+// cdKeyString is the CD-key-check field baked into aomxnocd1.exe (see
+// this project's own memory note "paullovesjade is not a name") - the
+// host sends it once per client right after the initial handshake, and
+// the client echoes it straight back, once, before any real lobby
+// traffic (name broadcast, settings sync) begins. Confirmed in every
+// capture this session: this exact round-trip appears exactly once per
+// client, never recurs, and its client->host half is the clearest
+// available signal that a client has genuinely finished connecting, not
+// merely opened a socket - see isCDKeyEcho and
+// lobby/join-cushion-design.md's event-driven revision.
+var cdKeyString = append([]byte("paullovesjade"), 0x00)
+
+// isCDKeyEcho reports whether payload is a client's own echo of
+// cdKeyString back to the host, sent client->backend on the session
+// port. Same 6-byte "03 00/seq/conn-id" wrapper as isNewPeerBroadcast
+// (byte 1 deliberately not checked either, same reasoning - see that
+// function's own 2026-08-20 correction), followed by a 2-byte length
+// prefix and the string itself.
+func isCDKeyEcho(payload []byte) bool {
+	const wrapperLen = 6
+	const lenPrefixLen = 2
+	if len(payload) < wrapperLen+lenPrefixLen+len(cdKeyString) {
+		return false
+	}
+	if payload[0] != newPeerWrapperType0 {
+		return false
+	}
+	body := payload[wrapperLen:]
+	if body[0] != byte(len(cdKeyString)) || body[1] != 0x00 {
+		return false
+	}
+	return bytes.Equal(body[lenPrefixLen:lenPrefixLen+len(cdKeyString)], cdKeyString)
 }
 
 // sockaddrInAddr reads the sin_port/sin_addr fields (big-endian, matching
@@ -1036,6 +1087,40 @@ type hostCandidate struct {
 	// Set once during pool construction in main(), same pattern as
 	// today's single match.closeSession wiring.
 	match *matchState
+
+	// firstClientJoinedAt is when this host was assigned to its current
+	// first client - zero until then. Used by hostCooling
+	// (lobby/join-cushion-design.md) to withhold telling a *different*
+	// client this host exists for joinCushion, giving the host's own
+	// DirectPlay8 engine time to settle the first one first. Written only
+	// by selectLocked (under hostPool.mu, when this host is picked from
+	// the empty tier - at *assignment* time, which for a client's own
+	// first discovery packet is well before it ever reaches the session
+	// port) and naturally re-stamped the next time this host goes back
+	// to zero real clients and is picked again - no separate reset path
+	// needed. firstClientIP, stamped alongside, is what makes it
+	// possible to tell "this is the same client the cushion started for"
+	// apart from "this is someone else" without needing a real
+	// session-port session to exist yet - see hostCooling.
+	firstClientJoinedAt time.Time
+	firstClientIP       string
+
+	// firstClientLandedAt is when this host's first client's own CD-key
+	// echo (isCDKeyEcho) was observed - zero until then. This is the
+	// event-driven half of the join cushion (lobby/join-cushion-design.md,
+	// fourth revision): once set, hostCooling switches from the blind
+	// joinCushion timer (a guess, measured from *assignment*, not
+	// completion) to postLandCooldown (a much shorter, confirmed-safe
+	// buffer measured from *actual landing*). Written by
+	// markFirstClientLanded, called from sessionProxy.forwardToBackend
+	// when it observes cdKeyString echoed back by whichever client
+	// currently holds firstClientIP - never by a different client's own
+	// echo, so a second client's own landing doesn't get mistaken for
+	// the first's. Reset back to zero the same moment
+	// firstClientJoinedAt/firstClientIP are re-stamped (selectLocked's
+	// empty-tier branch), so a fresh "first client" always starts this
+	// cushion from a clean state too.
+	firstClientLandedAt time.Time
 }
 
 // hostPool tracks every known aom-headless backend. Replaces the old
@@ -1061,11 +1146,6 @@ type hostPool struct {
 	// before this was built.
 	nextWaitingRR int
 	nextEmptyRR   int
-	// nextPeekRR is peekHost's own separate cursor - kept independent of
-	// the two above so non-committing discovery-time peeks don't perturb
-	// selectLocked's own round-robin fairness for real, sticky
-	// assignments.
-	nextPeekRR int
 	// sessionCountForHost is sessionProxy's own per-host session
 	// counter (sessionProxy.sessionCountForHost), wired up in main()
 	// once sessionProxy exists - same chicken-and-egg reason
@@ -1149,7 +1229,7 @@ func (p *hostPool) assignForClient(clientIP string) (*hostCandidate, bool) {
 		log.Printf("[pool] client %s's assigned host %s is no longer in the pool, reassigning", clientIP, h.id)
 		delete(p.assigned, clientIP)
 	}
-	h, ok := p.selectLocked()
+	h, ok := p.selectLocked(clientIP)
 	if !ok {
 		return nil, false
 	}
@@ -1251,21 +1331,21 @@ func (p *hostPool) hostLive(h *hostCandidate) bool {
 // On the race packet-handling-design.md's "The race this needs to guard
 // against" section flags (two clients connecting within the same few
 // seconds both landing on the same host before either session is
-// registered): this is actually already closed, not just unaddressed.
-// assignForClient (the only caller of this method) is only ever reached
-// via sessionProxy.forwardToBackend, which in turn is only ever called
-// from sessionProxy.run()'s single sequential ReadFromUDP loop - there is
-// no other call site. Go processes that loop one packet at a time, and
-// forwardToBackend doesn't return until the new session is fully
-// inserted into p.sessions, so two different clients' assignment
-// decisions can never actually interleave - by the time a second
-// client's packet is even read, the first client's session already
-// exists and sessionCountForHost already reflects it. This invariant
-// depends on assignForClient never being called from anywhere else
-// (e.g. a future second goroutine) - worth remembering if that ever
-// changes, since it's what makes a claim/reservation mechanism
-// unnecessary today rather than merely un-implemented.
-func (p *hostPool) selectLocked() (*hostCandidate, bool) {
+// registered): correction (lobby/join-cushion-design.md, 2026-08-23) -
+// this section used to claim that race was fully closed by
+// sessionProxy.run()'s single sequential loop being assignForClient's
+// only call site. That stopped being true the moment discoveryProxy
+// started calling pool.assignForClient too (see selectHost's own doc
+// comment on *proxy) - two genuinely concurrent goroutines can now both
+// reach this method for two different clients at once. Still safe
+// (p.mu serializes the actual read-modify-write, so no corruption or
+// double-assignment is possible), just no longer *deterministically
+// ordered* the way the old claim implied - whichever goroutine's call
+// acquires p.mu first wins, and that's fine, since the join cushion
+// below doesn't depend on ordering between two *different* clients'
+// concurrent first contacts, only on real elapsed time once a host has
+// its first client.
+func (p *hostPool) selectLocked(clientIP string) (*hostCandidate, bool) {
 	var waiting, empty []*hostCandidate
 	for _, h := range p.hosts {
 		if p.hostFull(h) || !p.hostLive(h) {
@@ -1275,7 +1355,28 @@ func (p *hostPool) selectLocked() (*hostCandidate, bool) {
 		if p.sessionCountForHost != nil {
 			n = p.sessionCountForHost(h)
 		}
-		if n == 0 {
+		// A host already claimed by a still-cushion-protected first
+		// client is never "empty" for bucketing purposes, even if
+		// sessionCountForHost still reads 0 - that just means the claim
+		// hasn't reached the session port yet, not that the host is
+		// actually free. Found live (2026-08-23) as a second, real bug
+		// in the same area as hostCooling's own correction: without this,
+		// a *different* client's own discovery ping arriving in that
+		// same window would see n == 0, land in the empty bucket below,
+		// and re-stamp firstClientIP/firstClientJoinedAt to itself -
+		// silently clobbering the first client's claim rather than being
+		// matched to the same host as a legitimate second player. Treated
+		// as "waiting" so that's exactly what happens instead: a
+		// genuinely different client still gets correctly matched here
+		// (the actual pairing decision), it just won't be *told* about
+		// it until hostCooling says it's safe (see forwardToBackend).
+		// Not a concern for the *same* client re-pinging before reaching
+		// the session port - assignForClient's own p.assigned cache
+		// returns its cached host without ever calling selectLocked
+		// again, so this loop never re-evaluates a host for the client
+		// that's already claiming it.
+		claimed := h.firstClientIP != "" && time.Since(h.firstClientJoinedAt) < joinCushion
+		if n == 0 && !claimed {
 			empty = append(empty, h)
 		} else {
 			waiting = append(waiting, h)
@@ -1290,48 +1391,102 @@ func (p *hostPool) selectLocked() (*hostCandidate, bool) {
 	if len(empty) > 0 {
 		h := empty[p.nextEmptyRR%len(empty)]
 		p.nextEmptyRR++
+		// Starts h's join cushion (lobby/join-cushion-design.md) - this
+		// client is about to become h's first real client, so a
+		// *different* client shouldn't be told this host exists (not
+		// *selected*, that's untouched - only *admitted*, see
+		// forwardToBackend/hostCooling) until joinCushion has passed.
+		// firstClientIP is what makes that distinction possible from the
+		// very first discovery packet onward, before this client has
+		// even reached the session port - correction (2026-08-23): the
+		// cushion used to be keyed on sessionCountForHost(h) == 1, which
+		// only becomes true once a real session-port connection exists.
+		// Confirmed live that this left the window between a client's
+		// discovery-time assignment and its own session-port connect
+		// completely unprotected - a second client's discovery contact
+		// arriving in that window saw sessionCountForHost(h) == 0 (not
+		// 1) and sailed straight through, since nothing had reached the
+		// session port yet for *either* client. firstClientIP has no
+		// such gap: it's set here, at the moment of assignment, which is
+		// as early as this host's "first client" concept can possibly
+		// exist. Both fields re-stamp together fresh every time a host
+		// is picked from this tier, including a host that had clients
+		// before who've since left - sessionCountForHost reading back to
+		// 0 is exactly what routes selection through this branch again.
+		h.firstClientJoinedAt = time.Now()
+		h.firstClientIP = clientIP
+		h.firstClientLandedAt = time.Time{} // fresh claim, not landed yet
 		return h, true
 	}
 	return nil, false
 }
 
-// peekHost returns any currently-eligible (not full) host, round-robin
-// via its own independent cursor - deliberately NOT sticky and NOT
-// tier-aware like selectLocked/assignForClient. Used by discoveryProxy
-// to pick a backend to relay a 0x25/0x26 discovery exchange through
-// without committing the client to it - see this session's "Defer host
-// assignment from discovery-time to session-connect-time" change.
-// Discovery/enumeration traffic doesn't represent real intent to connect
-// (a client's LAN/Direct-IP screen fires 0x25 queries just from being
-// open - see docs/directplay8-protocol.md and the official [MC-DPL8CS]
-// spec, both confirming Direct-Connect reuses the exact same enumeration
-// exchange as passive LAN browsing), so matchmaking's real,
-// sticky, tiered decision belongs on the session-port handshake that
-// follows, not here - see assignForClient.
+// hostCooling reports whether h is still within its post-join cushion
+// (lobby/join-cushion-design.md) *for a client other than the one it
+// started for* - self-locking, safe to call from outside hostPool. Used
+// by forwardToBackend on both proxies: for a brand-new session
+// (withhold the reply rather than committing this client to a host that
+// isn't safe to admit onto yet) and, on discoveryProxy specifically,
+// for every packet of an already-open one too (a session that started
+// *before* this host had a first client at all would otherwise sail
+// through untouched forever).
 //
-// Still relays through a genuine backend rather than synthesizing a
-// reply from nothing: the reply's meaningful fields get rewritten to
-// this proxy's own address regardless of which backend answered (see
-// discoveryRewrite), but the message also carries several bytes of
-// still-unexplained data (docs/directplay8-protocol.md's "sin_zero"
-// notes) that this project has never fabricated - every rewrite path
-// elsewhere only overwrites known fields on top of a genuine relayed
-// reply, and this keeps that same posture.
-func (p *hostPool) peekHost() (*hostCandidate, bool) {
+// Correction (2026-08-23): this used to check
+// sessionCountForHost(h) == 1, which only becomes true once a real
+// session-port connection exists - confirmed live that this left the
+// window between a client's discovery-time assignment and its own
+// session-port connect completely unprotected, since a *different*
+// client's discovery contact arriving in that window saw
+// sessionCountForHost(h) == 0 (nobody had reached the session port yet
+// for *either* client) and sailed straight through. Comparing against
+// h.firstClientIP directly has no such gap - it's set at the moment of
+// assignment, as early as this host's "first client" concept can
+// possibly exist, and requestingIP naturally equals it for that same
+// client's own repeated retries (which must never get silenced by their
+// own cushion), while differing for a genuinely different client.
+//
+// Fourth revision (2026-08-23): a flat timer measured from *assignment*
+// is a guess about how long a client takes to actually finish
+// connecting, and a guess can be wrong in both directions - too short
+// risks the exact host-side race this whole design exists to avoid, too
+// long wastes a second client's own limited connect budget for no
+// reason. Once firstClientLandedAt is set (markFirstClientLanded, fired
+// when the first client's own CD-key echo is observed - the one
+// confirmed client->host round-trip in the whole handshake, see
+// isCDKeyEcho), that becomes the real signal: postLandCooldown measured
+// from *actual completion* rather than joinCushion measured from mere
+// assignment. joinCushion stays in play only as a fallback ceiling, for
+// the case that echo is somehow never observed at all.
+func (p *hostPool) hostCooling(h *hostCandidate, requestingIP string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	var eligible []*hostCandidate
-	for _, h := range p.hosts {
-		if !p.hostFull(h) && p.hostLive(h) {
-			eligible = append(eligible, h)
-		}
+	if h.firstClientIP == requestingIP {
+		return false
 	}
-	if len(eligible) == 0 {
-		return nil, false
+	if !h.firstClientLandedAt.IsZero() {
+		return time.Since(h.firstClientLandedAt) < postLandCooldown
 	}
-	h := eligible[p.nextPeekRR%len(eligible)]
-	p.nextPeekRR++
-	return h, true
+	if h.firstClientJoinedAt.IsZero() {
+		return false
+	}
+	return time.Since(h.firstClientJoinedAt) < joinCushion
+}
+
+// markFirstClientLanded records that h's current first client
+// (checked here, under lock, against senderIP - not read unlocked by the
+// caller) has been observed echoing the CD-key string back to the host
+// (isCDKeyEcho) - the switch from hostCooling's joinCushion fallback to
+// its real, event-driven postLandCooldown gate. A no-op if senderIP
+// isn't h's current first client - either a second client's own later
+// echo (must never be mistaken for the first's), or h has since been
+// reassigned to a different first client entirely (this echo belonged
+// to a claim that's no longer current).
+func (p *hostPool) markFirstClientLanded(h *hostCandidate, senderIP string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if h.firstClientIP == senderIP && h.firstClientLandedAt.IsZero() {
+		h.firstClientLandedAt = time.Now()
+	}
 }
 
 // hostForBackendIP returns whichever pool member's session-port backend
@@ -1802,13 +1957,19 @@ type proxy struct {
 	pool               *hostPool
 	backendAddrForHost func(h *hostCandidate) string
 	// selectHost picks which host a new client's first packet through
-	// this proxy gets dialed to - the two proxies plug in different
-	// behavior here (added when host assignment moved from
-	// discovery-time to session-connect-time): sessionProxy uses
-	// pool.assignForClient (sticky, tiered - this is the real
-	// matchmaking decision, see that method's doc comment on why it
-	// belongs here and not on discovery traffic). discoveryProxy uses
-	// pool.peekHost (non-committing - see that method's doc comment).
+	// this proxy gets dialed to - both proxies use pool.assignForClient
+	// (sticky, tiered - see that method's own doc comment). Discovery
+	// used to use the separate, non-committing pool.peekHost, on the
+	// reasoning that discovery traffic doesn't represent real connect
+	// intent - correction (lobby/join-cushion-design.md, 2026-08-23):
+	// that reasoning doesn't hold with broadcast suppression active
+	// (confirmed live - a real LAN-browse screen shows nothing today),
+	// so every 0x25 this proxy ever sees is a unicast query to a
+	// specifically typed Direct-IP address, i.e. genuine intent. Both
+	// proxies now make the same real, sticky matchmaking decision -
+	// discoveryProxy's own forwardToBackend is what decides whether it's
+	// safe to actually *tell* a client about the result yet (see
+	// hostCooling).
 	selectHost func(clientIP string) (*hostCandidate, bool)
 
 	rewriteToBackend func(payload []byte, cfg config, sess *session) []byte
@@ -2316,6 +2477,55 @@ func (p *proxy) relayBackendInitiated(payload []byte, host *hostCandidate) {
 	}
 }
 
+// synthesizeDiscoveryDecline sends discoveryProxy's existing synthesized
+// "no host to talk to" reply - the same one used for a genuinely empty/
+// full pool - to clientAddr. Factored out so the join cushion's own
+// discovery-port gate (see forwardToBackend's existing-session check
+// below) can produce the identical client-visible experience as the
+// no-eligible-host case above it: a client sees the same thing either
+// way, whether there's truly no host at all or a host that's there but
+// still cooling down for someone else.
+func (p *proxy) synthesizeDiscoveryDecline(clientAddr *net.UDPAddr, payload []byte) {
+	key := clientAddr.String()
+	// The client's LAN-browse/Direct-Connect screen fires two genuinely
+	// different query types on this port, not just one - the 0x25
+	// enumerate query and a separate 0x20 liveness ping (see
+	// synthesizeEmptyPoolPingReply's own doc comment for the live bug
+	// this distinction fixes). Reply with the shape that actually
+	// matches what was asked.
+	var queryType byte
+	if len(payload) > 0 {
+		queryType = payload[0]
+	}
+	var out []byte
+	if queryType == 0x20 {
+		out = synthesizeEmptyPoolPingReply(p.cfg)
+		// Real host capture (2026-08-17) confirmed the host proactively
+		// opens the session-port handshake right around this point,
+		// unprompted - see onDiscoveryPingNoHost's own doc comment.
+		// Fire-and-forget: does nothing if already kicked off for this
+		// client (retried pings are common).
+		if p.onDiscoveryPingNoHost != nil {
+			// The client's own self-described sockaddr sits at payload
+			// offset 5 (5-byte 0x20 header), its sin_zero within that at
+			// offset 5+8=13, 8 bytes - see synthesizedSockaddr's doc
+			// comment (corrected 2026-08-18) for why this must be
+			// learned and echoed back, not invented.
+			var clientSinZero [8]byte
+			if len(payload) >= 21 {
+				copy(clientSinZero[:], payload[13:21])
+			}
+			p.onDiscoveryPingNoHost(clientAddr.IP, clientSinZero)
+		}
+	} else {
+		out = synthesizeEmptyPoolDiscoveryReply(p.cfg)
+	}
+	log.Printf("[%s] no eligible host: sending synthesized reply (query type 0x%02x) to client %s", p.name, queryType, key)
+	if _, err := p.clientConn.WriteToUDP(out, clientAddr); err != nil {
+		log.Printf("[%s] sending synthesized discovery reply to %s: %v", p.name, key, err)
+	}
+}
+
 func (p *proxy) forwardToBackend(clientAddr *net.UDPAddr, payload []byte) {
 	key := clientAddr.String()
 
@@ -2344,8 +2554,10 @@ func (p *proxy) forwardToBackend(clientAddr *net.UDPAddr, payload []byte) {
 		// sessionProxy's own call is the first one to reach
 		// selectLocked's real logic rather than assignForClient's cached
 		// fast path. That only started happening once discovery-time
-		// assignment was removed (see hostPool.peekHost's doc comment) -
-		// before that, discoveryProxy always populated pool.assigned
+		// assignment was briefly, separately removed - both proxies use
+		// pool.assignForClient again now, see selectHost's own doc
+		// comment on *proxy - before that regression, discoveryProxy
+		// always populated pool.assigned
 		// first, so this path was dormant. Reproduced live: the whole
 		// status HTTP server wedged too, since the deadlocked goroutine
 		// never reached assignForClient's own deferred pool.mu.Unlock()
@@ -2364,51 +2576,49 @@ func (p *proxy) forwardToBackend(clientAddr *net.UDPAddr, payload []byte) {
 			// there's deliberately no real backend involved.
 			switch p.name {
 			case "discovery":
-				// The client's LAN-browse/Direct-Connect screen fires
-				// two genuinely different query types on this port,
-				// not just one - the 0x25 enumerate query and a
-				// separate 0x20 liveness ping (see
-				// synthesizeEmptyPoolPingReply's own doc comment for
-				// the live bug this distinction fixes). Reply with
-				// the shape that actually matches what was asked.
-				var queryType byte
-				if len(payload) > 0 {
-					queryType = payload[0]
-				}
-				var out []byte
-				if queryType == 0x20 {
-					out = synthesizeEmptyPoolPingReply(p.cfg)
-					// Real host capture (2026-08-17) confirmed the host
-					// proactively opens the session-port handshake right
-					// around this point, unprompted - see
-					// onDiscoveryPingNoHost's own doc comment. Fire-and-
-					// forget: does nothing if already kicked off for
-					// this client (retried pings are common).
-					if p.onDiscoveryPingNoHost != nil {
-						// The client's own self-described sockaddr sits
-						// at payload offset 5 (5-byte 0x20 header), its
-						// sin_zero within that at offset 5+8=13, 8 bytes -
-						// see synthesizedSockaddr's doc comment (corrected
-						// 2026-08-18) for why this must be learned and
-						// echoed back, not invented.
-						var clientSinZero [8]byte
-						if len(payload) >= 21 {
-							copy(clientSinZero[:], payload[13:21])
-						}
-						p.onDiscoveryPingNoHost(clientAddr.IP, clientSinZero)
-					}
-				} else {
-					out = synthesizeEmptyPoolDiscoveryReply(p.cfg)
-				}
-				log.Printf("[%s] no eligible host: sending synthesized reply (query type 0x%02x) to client %s", p.name, queryType, key)
-				if _, err := p.clientConn.WriteToUDP(out, clientAddr); err != nil {
-					log.Printf("[%s] sending synthesized discovery reply to %s: %v", p.name, key, err)
-				}
+				p.synthesizeDiscoveryDecline(clientAddr, payload)
 			case "session":
 				p.simulateSessionPacket(clientAddr, payload)
 			}
 			return
 		}
+
+		// Join cushion (lobby/join-cushion-design.md, third revision): if
+		// this client would be host's SECOND real client, and the first
+		// one joined less than joinCushion ago, don't let this client
+		// find out this host exists yet - deliberately does NOT change
+		// which host was selected above (selectHost's own priority -
+		// prefer a host already waiting for a second player - already
+		// made the correct match; this only withholds telling this
+		// client about it yet). Gated on both proxies now, primarily on
+		// discovery: a client that never gets a real 0x26 has no host
+		// address to open a session-port connection to at all, so the
+		// session-port check below is a backstop, not the main gate -
+		// see this doc's "History" section for why discovery is where
+		// this actually has to happen (confirmed live 2026-08-23 that
+		// gating session-port admission alone doesn't stop the real
+		// host's own broadcast-to-the-first-client race, which fires at
+		// admission regardless of how long the second client was made to
+		// wait beforehand).
+		if p.pool.hostCooling(host, clientAddr.IP.String()) {
+			// Silent drop, deliberately no reply of any kind - not even
+			// the synthesized "no eligible host" reply used just above,
+			// which would incorrectly tell this client no game exists at
+			// all when one genuinely does, just isn't safe to admit onto
+			// yet. The client's own discovery query (and, on the session
+			// port, its handshake open) already retries unprompted on
+			// its own with zero replies needed to keep going - confirmed
+			// live, ~275ms for discovery's 0x25, ~100ms for session's
+			// 0x00 (see simulateSessionPacket's own doc comment on the
+			// 2026-08-17 correction for that evidence). The very next
+			// retry after joinCushion elapses re-enters this same
+			// function and proceeds normally below - no re-selection
+			// needed, this client was already correctly matched to host
+			// above, it just wasn't told yet.
+			log.Printf("[%s] host %s still cooling down for client %s, withholding reply (will retry on its own)", p.name, host.id, key)
+			return
+		}
+
 		backendAddr := p.backendAddrForHost(host)
 		backendUDPAddr, err := net.ResolveUDPAddr("udp", backendAddr)
 		if err != nil {
@@ -2440,6 +2650,45 @@ func (p *proxy) forwardToBackend(clientAddr *net.UDPAddr, payload []byte) {
 	sess.mu.Lock()
 	sess.lastSeen = time.Now()
 	sess.mu.Unlock()
+
+	// Join cushion, event-driven half (lobby/join-cushion-design.md,
+	// fourth revision): this client's own CD-key echo is the signal that
+	// it has genuinely finished connecting, not just opened a socket -
+	// see isCDKeyEcho/markFirstClientLanded's own doc comments. Only
+	// meaningful (and only checked) for sessionProxy, since that's the
+	// port this echo happens on. markFirstClientLanded does its own
+	// h.firstClientIP comparison under hostPool.mu (not read here
+	// directly, unlike every other access to that field) and no-ops for
+	// anyone but the host's actual current first client - a *second*
+	// client's own echo, once it lands too, must never be mistaken for
+	// the first's and re-trigger this.
+	if p.name == "session" && sess.host != nil && isCDKeyEcho(payload) {
+		p.pool.markFirstClientLanded(sess.host, clientAddr.IP.String())
+	}
+
+	// Join cushion, closing the discovery-port gap (lobby/join-cushion-
+	// design.md): the check above only stops a *new* discovery session
+	// from being created against a cooling host - a session that started
+	// before this host had a first client at all (its own IP became
+	// h.firstClientIP, or it hasn't yet) sails straight through it, since
+	// it only applies at creation time. Confirmed live 2026-08-23 that
+	// this isn't an edge case: a second client's discovery contact
+	// routinely arrives before the first client's own assignment even
+	// happens, at which point there was nothing yet to gate against.
+	// Re-checked here, on every packet of every existing discovery
+	// session, so a host that starts cooling *after* this session was
+	// created still gets protected. hostCooling's own firstClientIP
+	// comparison exempts the host's own already-assigned client
+	// specifically (if its discovery traffic is still flowing at all,
+	// that's normal background browsing, not a second client sneaking
+	// in) - only a genuinely different client peeking at a cooling host
+	// is held back, and (same reasoning as the new-session check above)
+	// silently, not with a synthesized decline - this client's game
+	// genuinely exists, it's just not safe to admit onto yet.
+	if p.name == "discovery" && sess.host != nil && p.pool.hostCooling(sess.host, clientAddr.IP.String()) {
+		log.Printf("[%s] host %s still cooling down for client %s (existing session), withholding reply", p.name, sess.host.id, key)
+		return
+	}
 
 	out := payload
 	if p.rewriteToBackend != nil {
@@ -3435,7 +3684,7 @@ func main() {
 		clientConn:         mustListen(cfg.discoveryListenAddr),
 		pool:               pool,
 		backendAddrForHost: func(h *hostCandidate) string { return h.discoveryBackendAddr },
-		selectHost:         func(string) (*hostCandidate, bool) { return pool.peekHost() },
+		selectHost:         pool.assignForClient,
 		onClientPacket:     tracker.set,
 		rewriteToClient: func(payload []byte, cfg config, sess *session) []byte {
 			out := discoveryRewrite(payload, cfg)
