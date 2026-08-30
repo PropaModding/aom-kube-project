@@ -1,0 +1,97 @@
+# AKS variant of k8s/aom-headless-netpol.yaml - a real redesign, not a
+# port. The minikube version denies only the local docker-bridge subnet
+# spoofed test clients live on and does NOT restrict egress to the rest
+# of the cluster pod network at all (see that file's own header comment
+# and CLAUDE.md's already-documented correction on this point). On AKS
+# there's no "spoofed sibling container on a shared bridge" concept at
+# all - real players are internet addresses, and aom-headless has no
+# legitimate reason to reach anything except aom-lobby + DNS directly.
+# This is a genuine tightening versus minikube's actual behavior, not
+# just a mechanical translation.
+#
+# Requires AKS's network-policy add-on enabled (azure/main.tf's
+# network_profile.network_policy = "azure") - same class of "silently
+# no-ops without the right CNI/add-on" gotcha as minikube needing
+# --cni=calico. Verify enforcement the same way CLAUDE.md's own
+# original bypass investigation did: kubectl exec into an aom-headless
+# pod, confirm arbitrary egress is denied and aom-lobby/DNS are not.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: aom-headless-lockdown
+spec:
+  podSelector:
+    matchLabels:
+      app: aom-headless
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    # Only aom-lobby ever legitimately talks to this pod's game/relay
+    # ports - closes a real gap the minikube version never had at all
+    # (today, on minikube, any pod in the cluster can reach these
+    # ports; nothing has ever restricted ingress here).
+    - from:
+        - podSelector:
+            matchLabels:
+              app: aom-lobby
+      ports:
+        - protocol: UDP
+          port: 2299
+        - protocol: UDP
+          port: 2300
+        - protocol: TCP
+          port: 8082
+    # host-health-agent also needs ingress to 2299/UDP for its own
+    # probe, but it runs hostNetwork: true (a DaemonSet), so its traffic
+    # arrives as the *node's* own IP, not a distinct pod IP podSelector
+    # can match. Confirmed live 2026-08-24: AKS here uses Azure CNI
+    # (`az aks show` - network_plugin=azure), which gives pods AND nodes
+    # IPs from the SAME VNet subnet (aks-subnet, 10.224.0.0/16 - found
+    # via `az network vnet subnet list` against the cluster's own
+    # MC_*_australiaeast node resource group) - a blanket ipBlock for
+    # that whole /16 would let ANY pod reach this port, defeating the
+    # entire point of this ingress restriction. Scoped instead to the
+    # two node IPs themselves (`kubectl get nodes -o wide`), where
+    # host-health-agent's hostNetwork traffic actually originates.
+    # Real, accepted maintenance cost: this needs updating if the node
+    # pool is ever resized/replaced (new nodes get different IPs) - a
+    # narrow, correct-today policy beats a broad, permanently-wrong one.
+    - from:
+        - ipBlock:
+            cidr: 10.224.0.33/32
+        - ipBlock:
+            cidr: 10.224.0.4/32
+      ports:
+        - protocol: UDP
+          port: 2299
+  egress:
+    # No port restriction here, deliberately - found live 2026-08-25 this
+    # was the actual bug blocking every real connection attempt. aom-lobby
+    # dials this pod from an OS-assigned ephemeral local port (see
+    # lobby/main.go's forwardToBackend, net.DialUDP with a nil local
+    # address), not from 2299/2300 - those are aom-lobby's own *listening*
+    # ports for traffic arriving from real clients, irrelevant to this
+    # leg. So aom-headless's own reply is addressed to that ephemeral
+    # port, which a port-restricted egress rule here would silently drop
+    # (NetworkPolicy egress `ports` matches the destination port of
+    # traffic leaving the pod). The destination is already locked down to
+    # exactly aom-lobby via podSelector - restricting the port on top
+    # adds no real security once the peer itself is already pinned, and
+    # doing so wrongly broke every connection outright.
+    - to:
+        - podSelector:
+            matchLabels:
+              app: aom-lobby
+    # DNS - not currently needed by aom-headless at runtime (it never
+    # resolves a hostname; Xvfb/wine/aomxnocd1.exe/input-agent are all
+    # local), but cheap to allow and avoids surprising breakage for
+    # future debugging (kubectl exec + apt/curl, etc.) - same reasoning
+    # as the minikube version.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53

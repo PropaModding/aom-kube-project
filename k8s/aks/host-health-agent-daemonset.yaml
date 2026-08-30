@@ -1,0 +1,62 @@
+# AKS variant of k8s/host-health-agent-daemonset.yaml - see that file's
+# own header comment for the full design rationale, unchanged here.
+# Differences: image pulled from ACR instead of loaded straight into
+# minikube's own daemon, and a securityContext hardening block (non-root
+# enforcement, dropped capabilities, no privilege escalation) - backstop
+# on top of dockerfile.host-health-agent's own USER healthagent.
+#
+# hostNetwork/downward-API pattern is unchanged and fully portable -
+# DaemonSet + hostNetwork + status.hostIP/spec.nodeName all work
+# identically on AKS.
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: host-health-agent
+  labels:
+    app: host-health-agent
+spec:
+  selector:
+    matchLabels:
+      app: host-health-agent
+  template:
+    metadata:
+      labels:
+        app: host-health-agent
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      serviceAccountName: host-health-agent
+      containers:
+        - name: host-health-agent
+          image: aomkubeacr.azurecr.io/host-health-agent:latest
+          imagePullPolicy: Always  # :latest tag reused on every rebuild during active iteration - IfNotPresent silently served a stale cached image (found live 2026-08-25), Always guarantees the node re-checks the digest
+          securityContext:
+            runAsNonRoot: true
+            # Required alongside runAsNonRoot: dockerfile.host-health-agent's
+            # USER directive uses a name (healthagent), not a numeric UID,
+            # and kubelet can't verify "is this non-root" from a name alone
+            # - confirmed live 2026-08-25 (CreateContainerConfigError:
+            # "container has runAsNonRoot and image has non-numeric user").
+            # 1000 confirmed via `docker run --entrypoint id`.
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: status-http
+              containerPort: 8090
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: ":8090"
+            - name: NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "16Mi"
+            limits:
+              cpu: "100m"
+              memory: "32Mi"

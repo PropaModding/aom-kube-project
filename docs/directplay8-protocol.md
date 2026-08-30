@@ -527,13 +527,23 @@ type 0x02 (handshake ack) - newly identified:
                                       acknowledging
   bytes 6-39: 00 00 00 00 00 00 00 e9 e9 7f a4 00 01 00 18 f7 32 00
               3f e4 d4 7f a4 00 01 00 01 00 00 00 18 f7 32 00
-              - byte-for-byte IDENTICAL in every type 0x02 seen so far,
-                across totally separate Wine process instances in two
-                unrelated captures. Same reasoning as the "paullovesjade"
-                string below: identical bytes across independent runs
-                rules out a memory pointer/per-session token, so this is
-                almost certainly a fixed protocol constant, not something
-                requiring translation. Not yet decoded further.
+              - **Correction (2026-08-25)**: the "byte-for-byte IDENTICAL
+                in every capture" claim below was wrong, based on too few
+                samples. The two bytes at relative offset 10 and 22 (abs
+                packet offset 16/28, shown as "a4" above) actually vary
+                per sender - "a6" and "a8" both also appear across older
+                captures (e.g. 20260808-234138-3client-p2p-check has both
+                "a4" and "a6" from different senders in the same pcap;
+                20260820-210009-p2p-pairing-byte1-root-cause, a *confirmed
+                working* session, has both "a4" and "a8"), and this was
+                re-confirmed live 2026-08-25 chasing an AKS connection
+                that never completed - its ack used "a8" too, initially
+                suspected as the cause, ruled out once "a8" turned up in
+                the older *working* capture above. Everything else in
+                this range does appear constant across every sample seen.
+                Not yet decoded further, and confirmed NOT a checksum/
+                validation field a client rejects on - a working session
+                tolerates all three observed values.
 ```
 
 Neither message embeds anything beyond the two `sockaddr_in` blocks in

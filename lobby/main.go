@@ -732,9 +732,22 @@ func playerAnnounceName(payload []byte) (string, bool) {
 
 // discoveryRewrite returns a copy of payload with the sin_port/sin_addr
 // fields of any embedded sockaddr_in blocks (per discoveryAddressOffsets)
-// replaced with the proxy's public address. sin_family and the still-
-// unexplained sin_zero bytes are left untouched rather than guessed at.
-func discoveryRewrite(payload []byte, cfg config) []byte {
+// replaced with ip:cfg.publicPort. sin_family and the still-unexplained
+// sin_zero bytes are left untouched rather than guessed at.
+//
+// ip is an explicit parameter, not read from cfg internally, because the
+// two call sites need different addresses despite sharing this same
+// rewrite logic: rewriteToClient (backend->client, 0x21/0x26) embeds an
+// address for a REAL CLIENT to use, which must be cfg.publicIP (the
+// externally-reachable one) - but rewriteToBackend (client->backend,
+// 0x20) embeds an address for the BACKEND pod to use, which must be
+// cfg.internalIP instead (see that field's own doc comment for the
+// live AKS bug - a Service's external VIP, unlike a real hostNetwork
+// address, isn't reliably reachable by another pod on a different node).
+// Passing cfg.publicIP for both, as this function used to do
+// unconditionally, silently broke the client->backend direction the
+// same way the session port's own client-self rewrite did.
+func discoveryRewrite(payload []byte, cfg config, ip [4]byte) []byte {
 	if len(payload) == 0 {
 		return payload
 	}
@@ -749,7 +762,7 @@ func discoveryRewrite(payload []byte, cfg config) []byte {
 			continue
 		}
 		binary.BigEndian.PutUint16(out[off+2:off+4], cfg.publicPort)
-		copy(out[off+4:off+8], cfg.publicIP[:])
+		copy(out[off+4:off+8], ip[:])
 	}
 	return out
 }
@@ -1828,6 +1841,29 @@ type config struct {
 	// host "self" address - always the session proxy's own listening
 	// port, since that's the one address clients ever need to know.
 	publicPort uint16
+	// internalIP is what the BACKEND (aom-headless) is told the client's
+	// own "self" address is, in the session handshake's client->backend
+	// direction (sessionSelfOffset) - deliberately separate from
+	// publicIP. Found live 2026-08-25 running on AKS: the backend's own
+	// reply targets whatever address it was told the client is at (the
+	// entire point of this rewrite - see CLAUDE.md's Goals, a real
+	// client's address must never reach the real host), so that address
+	// has to be something the backend pod can actually route a reply to
+	// directly. Under hostNetwork (minikube), publicIP genuinely was the
+	// pod's own real interface address, so this distinction never
+	// mattered. Once aom-lobby sits behind a LoadBalancer Service
+	// instead (k8s/aks/lobby-service.yaml), publicIP is the Service's
+	// external VIP - reachable by real internet clients, but NOT
+	// reliably reachable by another pod on a different node
+	// (externalTrafficPolicy: Local only accepts Service-IP traffic on
+	// nodes that host a local endpoint, silently dropping it from any
+	// other node - confirmed live: aom-headless pods scheduled on the
+	// node without aom-lobby had every reply vanish). internalIP is the
+	// pod's own real, directly-routable cluster IP (POD_IP downward
+	// API), always reachable pod-to-pod regardless of node or Service
+	// semantics - defaults to publicIP when POD_IP isn't set (minikube;
+	// the two are the same address there anyway).
+	internalIP [4]byte
 }
 
 func loadConfig() config {
@@ -1843,6 +1879,20 @@ func loadConfig() config {
 	cfg.statusListenAddr = getenv("STATUS_LISTEN_ADDR", ":8080")
 	cfg.verbose = getenv("VERBOSE", "") != ""
 	copy(cfg.publicIP[:], ip)
+
+	// See internalIP's own doc comment. Optional - not set at all on
+	// minikube (hostNetwork means publicIP already is the pod's real
+	// address), defaults to publicIP if absent or invalid rather than
+	// failing, since a missing POD_IP shouldn't be fatal the way a
+	// missing/malformed PUBLIC_ADDR is (that one has no sane fallback).
+	cfg.internalIP = cfg.publicIP
+	if podIP := getenv("POD_IP", ""); podIP != "" {
+		if parsed := net.ParseIP(podIP).To4(); parsed != nil {
+			copy(cfg.internalIP[:], parsed)
+		} else {
+			log.Printf("POD_IP %q is not a valid IPv4 address, falling back to PUBLIC_ADDR for backend-facing rewrites", podIP)
+		}
+	}
 
 	_, portStr, err := net.SplitHostPort(cfg.sessionListenAddr)
 	if err != nil {
@@ -1870,6 +1920,22 @@ const (
 	headlessDiscoveryPort  = 2299
 	headlessSessionPort    = 2300
 	headlessInputAgentPort = 8082
+
+	// A real client's own session-port socket is always locally bound to
+	// this fixed port too (confirmed live 2026-08-25 via a client's own
+	// WINEDEBUG WS_bind trace: "address <client-ip>, port 2300" -
+	// consistent with the "classic DirectPlay's session port is always
+	// 2300 on both sides" convention already established elsewhere in
+	// this file, e.g. beginSimulatedHostOpen's doc comment). Used in
+	// rewriteToClient's peer-field rewrite instead of the literal
+	// observed sess.clientAddr.Port - see that call site's own comment
+	// for the live AKS bug this fixes (a NAT hop between the client and
+	// aom-lobby can remap the wire-level source port away from 2300;
+	// what matters is matching the client's own fixed local self-belief,
+	// not the literal value a NAT happened to produce on the wire - the
+	// actual return-routing already uses sess.clientAddr, the real
+	// observed address, independently of this payload field).
+	clientSessionPort = 2300
 
 	podPollInterval = 3 * time.Second // same cadence as hostProbe's own ticker
 )
@@ -1903,7 +1969,6 @@ type podLister struct {
 	apiServer     string // e.g. "https://10.96.0.1:443"
 	namespace     string
 	labelSelector string
-	token         string
 	httpClient    *http.Client
 	cfg           config
 
@@ -1930,8 +1995,11 @@ func newInClusterPodLister(cfg config) *podLister {
 	if host == "" || port == "" {
 		log.Fatalf("KUBERNETES_SERVICE_HOST/KUBERNETES_SERVICE_PORT not set - aom-lobby must run as an in-cluster pod to discover aom-headless backends (see k8s/lobby-deployment.yaml)")
 	}
-	tokenBytes, err := os.ReadFile(serviceAccountDir + "/token")
-	if err != nil {
+	// Read-and-discard here is just a fail-fast startup check (same
+	// posture as the CA cert below) - the token itself is read fresh on
+	// every single list() call instead of cached, see readToken's own
+	// doc comment for why that matters.
+	if _, err := readToken(); err != nil {
 		log.Fatalf("reading ServiceAccount token: %v (is k8s/lobby-rbac.yaml applied, and serviceAccountName set on the aom-lobby Deployment?)", err)
 	}
 	caBytes, err := os.ReadFile(serviceAccountDir + "/ca.crt")
@@ -1947,7 +2015,6 @@ func newInClusterPodLister(cfg config) *podLister {
 		apiServer:     fmt.Sprintf("https://%s:%s", host, port),
 		namespace:     namespace,
 		labelSelector: labelSelector,
-		token:         strings.TrimSpace(string(tokenBytes)),
 		cfg:           cfg,
 		httpClient: &http.Client{
 			// Generous relative to an in-cluster API call (same node,
@@ -1959,6 +2026,28 @@ func newInClusterPodLister(cfg config) *podLister {
 			},
 		},
 	}
+}
+
+// readToken reads the ServiceAccount bearer token fresh from disk.
+// Deliberately NOT cached anywhere - found live 2026-08-25 running on
+// AKS for the first time for more than about an hour: kubelet rotates
+// this mounted token file in place well before its own ~1hr expiration
+// (a standard bound-ServiceAccount-token behavior, not AKS-specific -
+// this bug was always latent on minikube too, just never surfaced since
+// no test session here had ever left a pod running long enough to hit
+// it). A podLister that cached the token once at startup kept presenting
+// the original, since-expired token forever, failing every single API
+// call with 401 Unauthorized - permanently freezing hostPool's view of
+// which aom-headless pods exist, with no recovery short of a manual
+// restart. Re-reading this small local file on every list() call is
+// negligible overhead for something called once every few seconds, and
+// always picks up whatever kubelet has currently rotated in.
+func readToken() (string, error) {
+	b, err := os.ReadFile(serviceAccountDir + "/token")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
 }
 
 // podInfo is the subset of a Pod's API representation reconcileOnce
@@ -1980,7 +2069,11 @@ func (pl *podLister) list() ([]podInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set("Authorization", "Bearer "+pl.token)
+	token, err := readToken()
+	if err != nil {
+		return nil, fmt.Errorf("reading ServiceAccount token: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
 	resp, err := pl.httpClient.Do(req)
 	if err != nil {
 		return nil, err
@@ -2082,7 +2175,26 @@ func getenv(key, def string) string {
 }
 
 type session struct {
+	// Exactly one of backendConn/backendAddr is set, depending on which
+	// proxy owns this session - see lobby/backend-port-binding-design.md.
+	// discoveryProxy (p.name == "discovery") still dials its own per-
+	// session backendConn, unchanged from before this doc's own fix -
+	// discovery traffic is simple query/reply, not the multi-step
+	// handshake the fix's actual bug lives in, so it was deliberately
+	// left alone to keep this change scoped to where the real problem
+	// is. sessionProxy (p.name == "session") uses backendAddr instead:
+	// no per-session dial at all, sends via p.clientConn.WriteToUDP
+	// (the proxy's own already-bound :2300 listener) so the literal
+	// wire-level source port genuinely is what rewriteToBackend's own
+	// payload rewrite already claims it is (cfg.publicPort) - closing
+	// the same client-believes-a-lying-port gap clientSessionPort
+	// already fixed on the client-facing side, but for the backend-
+	// facing one. Found live 2026-08-26 via an ingress-level packet
+	// capture on aom-lobby's own pod: the old per-session
+	// net.DialUDP("udp", nil, ...) let the OS pick a random ephemeral
+	// local port, never matching the 2300 the payload claimed.
 	backendConn *net.UDPConn
+	backendAddr *net.UDPAddr
 	clientAddr  *net.UDPAddr // the real client this session relays for
 	// host is which pool member this session was assigned to (see
 	// hostPool.assignForClient) - added for N-host support. Every place
@@ -2342,21 +2454,54 @@ func (st *simulatedClientState) idleFor() time.Duration {
 // waiting is never evicted out from under itself.
 const simulatedClientIdleExpiry = 3 * time.Minute
 
-// closeSession forcibly closes and removes clientAddr's session, the
-// same effect as its backend connection erroring out naturally (that
-// existing path - backendToClient's own cleanup - is what actually does
-// the map removal and fires onSessionRemoved; this just triggers it).
+// doCloseSession removes key from p.sessions and fires onSessionRemoved,
+// directly - the actual cleanup previously only ever ran inside
+// backendToClient's own read-error path (closing sess.backendConn made
+// its blocked Read() error out, and that error path did the map removal
+// and onSessionRemoved call). sessionProxy sessions no longer have a
+// backendConn to close (see session.backendAddr's own doc comment on
+// session), so every call site that used to signal teardown indirectly
+// via .backendConn.Close() now calls this directly instead - see
+// lobby/backend-port-binding-design.md.
+//
+// Idempotent, same guarantee closeSession's own doc comment already
+// relied on (a resign burst's ~10 rapid duplicate packets can trigger
+// several close attempts for one real departure) - checking existence
+// before deleting/firing is what makes a second call on an already-gone
+// session a harmless no-op rather than a double-fire.
+func (p *proxy) doCloseSession(key string, sess *session) {
+	p.mu.Lock()
+	_, existed := p.sessions[key]
+	if existed {
+		delete(p.sessions, key)
+	}
+	p.mu.Unlock()
+	if existed && p.onSessionRemoved != nil {
+		p.onSessionRemoved(sess)
+	}
+}
+
+// closeSession forcibly closes and removes clientAddr's session.
+// discoveryProxy sessions still close their own dedicated backendConn,
+// triggering backendToClient's existing read-error cleanup unchanged;
+// sessionProxy sessions have no backendConn (see session.backendAddr's
+// doc comment) and are torn down directly via doCloseSession instead.
 // Idempotent and safe to call on an already-gone session: a resign burst
 // arrives as roughly ten rapid duplicate packets (see isResignBurst), so
 // this will typically be called several times per real departure.
 func (p *proxy) closeSession(clientAddr *net.UDPAddr) {
+	key := clientAddr.String()
 	p.mu.Lock()
-	sess, ok := p.sessions[clientAddr.String()]
+	sess, ok := p.sessions[key]
 	p.mu.Unlock()
 	if !ok {
 		return
 	}
-	sess.backendConn.Close()
+	if sess.backendConn != nil {
+		sess.backendConn.Close()
+	} else {
+		p.doCloseSession(key, sess)
+	}
 }
 
 // closeSessionsForHost is closeSession generalized to every session
@@ -2368,22 +2513,29 @@ func (p *proxy) closeSession(clientAddr *net.UDPAddr) {
 // matches under p.mu, then closes outside it - same
 // collect-then-act-unlocked shape reapIdleSessions already uses, so one
 // slow/blocking Close doesn't hold up every other session's lookup.
-// Deliberately just closes backendConn, same as closeSession: the actual
-// map removal and onSessionRemoved firing happen in backendToClient's
-// own read-error path once the close is observed there, not duplicated
-// here.
+// Same closeSession/doCloseSession branch as above, per session found -
+// discoveryProxy sessions close their own backendConn (existing read-
+// error path), sessionProxy sessions tear down directly.
 func (p *proxy) closeSessionsForHost(hostID string) {
 	p.mu.Lock()
-	var toClose []*session
-	for _, sess := range p.sessions {
+	type keyed struct {
+		key  string
+		sess *session
+	}
+	var toClose []keyed
+	for key, sess := range p.sessions {
 		if sess.host != nil && sess.host.id == hostID {
-			toClose = append(toClose, sess)
+			toClose = append(toClose, keyed{key, sess})
 		}
 	}
 	p.mu.Unlock()
-	for _, sess := range toClose {
-		log.Printf("[%s] closing session for client %s (host %s removed)", p.name, sess.clientAddr, hostID)
-		sess.backendConn.Close()
+	for _, kv := range toClose {
+		log.Printf("[%s] closing session for client %s (host %s removed)", p.name, kv.sess.clientAddr, hostID)
+		if kv.sess.backendConn != nil {
+			kv.sess.backendConn.Close()
+		} else {
+			p.doCloseSession(kv.key, kv.sess)
+		}
 	}
 }
 
@@ -2703,14 +2855,53 @@ func (p *proxy) relayBackendInitiated(payload []byte, host *hostCandidate) {
 		log.Printf("[%s] backend %s sent unsolicited data but no client seen yet, dropping", p.name, host.id)
 		return
 	}
+
+	// sessionProxy only (detectBackendOrigin, this function's only
+	// caller, is set for sessionProxy alone): a real session usually
+	// *does* exist for clientAddr here now, unlike when this function
+	// was purely for genuinely-unprompted broadcasts - sessionProxy no
+	// longer dials its own per-session backendConn (session.backendAddr's
+	// doc comment), so every backend reply, not just unprompted
+	// broadcasts, now arrives via this same path. Replicate
+	// backendToClient's own per-packet bookkeeping (connID/hostSeq
+	// learning, the welcome-message landing signal, lastSeen) against
+	// the *real* session when one exists, instead of only ever building
+	// a throwaway stand-in - see lobby/backend-port-binding-design.md.
+	realSess, hasRealSess := (*session)(nil), false
+	if p.name == "session" {
+		p.mu.Lock()
+		realSess, hasRealSess = p.sessions[clientAddr.String()]
+		p.mu.Unlock()
+	}
+
+	sessForRewrite := &session{clientAddr: clientAddr, host: host}
+	if hasRealSess {
+		sessForRewrite = realSess
+		realSess.mu.Lock()
+		realSess.lastSeen = time.Now()
+		justLanded := false
+		var landedConnID [2]byte
+		if !realSess.connIDKnown {
+			if id, ok := wrapperConnID(payload); ok {
+				realSess.connID = id
+				realSess.connIDKnown = true
+				justLanded = true
+				landedConnID = id
+			}
+		}
+		if seq, ok := wrapperSeq(payload); ok {
+			realSess.hostSeq = seq
+			realSess.hostSeqKnown = true
+		}
+		realSess.mu.Unlock()
+		if justLanded {
+			p.sendWelcomeMessage(clientAddr, landedConnID, realSess)
+		}
+	}
+
 	out := payload
 	if p.rewriteToClient != nil {
-		// No real *session exists for this direction (see the doc comment
-		// above) - just enough of one to carry the real client's address
-		// and host, which rewriteToClient needs for the session
-		// handshake's "peer" field and for looking up the right
-		// per-host matchState respectively.
-		out = p.rewriteToClient(payload, p.cfg, &session{clientAddr: clientAddr, host: host})
+		out = p.rewriteToClient(payload, p.cfg, sessForRewrite)
 	}
 	if _, err := p.clientConn.WriteToUDP(out, clientAddr); err != nil {
 		log.Printf("[%s] relay backend-initiated packet to client %s: %v", p.name, clientAddr, err)
@@ -2865,26 +3056,38 @@ func (p *proxy) forwardToBackend(clientAddr *net.UDPAddr, payload []byte) {
 			log.Printf("[%s] resolving backend %s (%s): %v", p.name, host.id, backendAddr, err)
 			return
 		}
-		// Bind the backend-facing socket to our own known public IP
-		// rather than letting the OS pick a local address via routing -
-		// this pod runs hostNetwork, so binding to the node's own
-		// address is always valid, and it guarantees the address we
-		// might embed in a rewritten packet (see rewriteToBackend on the
-		// session proxy) is actually reachable, instead of depending on
-		// whatever interface the kernel happened to route the backend
-		// dial through.
-		localAddr := &net.UDPAddr{IP: net.IP(p.cfg.publicIP[:])}
-		backendConn, err := net.DialUDP("udp", localAddr, backendUDPAddr)
-		if err != nil {
-			log.Printf("[%s] dialing backend %s (%s) for client %s: %v", p.name, host.id, backendAddr, key, err)
-			return
+		// sessionProxy: no per-session dial at all - see
+		// session.backendAddr's own doc comment and
+		// lobby/backend-port-binding-design.md for the full reasoning
+		// (a per-session net.DialUDP left the OS free to pick a random
+		// ephemeral local port, never matching what rewriteToBackend's
+		// own payload rewrite already claims aom-lobby's port is).
+		// Sends go through p.clientConn (the proxy's own already-bound
+		// :2300 listener) instead, further down this same function;
+		// replies arrive back on that same shared socket and are
+		// attributed to the right session via relayBackendInitiated
+		// (detectBackendOrigin, set for sessionProxy only).
+		//
+		// discoveryProxy: unchanged, still dials its own per-session
+		// backendConn with a nil local address (OS-picked ephemeral
+		// port) - discovery is simple query/reply, not the multi-step
+		// handshake the port-binding bug actually lives in, so it was
+		// deliberately left alone rather than folded into this redesign.
+		if p.name == "session" {
+			sess = &session{backendAddr: backendUDPAddr, clientAddr: clientAddr, host: host, lastSeen: time.Now()}
+		} else {
+			backendConn, err := net.DialUDP("udp", nil, backendUDPAddr)
+			if err != nil {
+				log.Printf("[%s] dialing backend %s (%s) for client %s: %v", p.name, host.id, backendAddr, key, err)
+				return
+			}
+			sess = &session{backendConn: backendConn, clientAddr: clientAddr, host: host, lastSeen: time.Now()}
+			go p.backendToClient(key, clientAddr, sess)
 		}
-		sess = &session{backendConn: backendConn, clientAddr: clientAddr, host: host, lastSeen: time.Now()}
 		p.mu.Lock()
 		p.sessions[key] = sess
 		p.mu.Unlock()
 		log.Printf("[%s] new session: client %s -> %s (%s)", p.name, key, host.id, backendAddr)
-		go p.backendToClient(key, clientAddr, sess)
 	}
 
 	sess.mu.Lock()
@@ -2950,7 +3153,28 @@ func (p *proxy) forwardToBackend(clientAddr *net.UDPAddr, payload []byte) {
 	if p.rewriteToBackend != nil {
 		out = p.rewriteToBackend(payload, p.cfg, sess)
 	}
-	if _, err := sess.backendConn.Write(out); err != nil {
+	// backendAddr (sessionProxy) sends via the shared p.clientConn;
+	// backendConn (discoveryProxy) still writes its own dedicated dial -
+	// see session.backendAddr's own doc comment.
+	//
+	// Success-path logging (verbose only) added 2026-08-28: the only
+	// thing previously logged here was a write *error* - meaning "the
+	// call succeeded, but the packet never arrived" and "this code path
+	// was never actually reached" were both silently indistinguishable
+	// from each other. A live capture at aom-lobby's own pod showed
+	// zero client->backend packets ever arriving on the wire despite no
+	// write errors logged anywhere - this closes that blind spot before
+	// the next live test, rather than continuing to guess at the network
+	// layer without first confirming the send call itself is even being
+	// made with the expected arguments.
+	if sess.backendAddr != nil {
+		n, err := p.clientConn.WriteToUDP(out, sess.backendAddr)
+		if err != nil {
+			log.Printf("[%s] write to backend for client %s: %v", p.name, key, err)
+		} else if p.cfg.verbose {
+			log.Printf("[%s] wrote %d bytes to backend %s for client %s (via shared :%d socket)", p.name, n, sess.backendAddr, key, p.cfg.publicPort)
+		}
+	} else if _, err := sess.backendConn.Write(out); err != nil {
 		log.Printf("[%s] write to backend for client %s: %v", p.name, key, err)
 	}
 }
@@ -3454,7 +3678,9 @@ func (p *proxy) reapIdleSessions() {
 					}
 				}
 			}
-			sess.backendConn.Close()
+			if sess.backendConn != nil {
+				sess.backendConn.Close()
+			}
 			delete(p.sessions, key)
 			removed = append(removed, sess)
 			log.Printf("[%s] closed idle session for client %s", p.name, key)
@@ -3590,9 +3816,15 @@ func (p *proxy) warnAndKickLonelyPlayer(host *hostCandidate) {
 	log.Printf("[lonely] %s: kicked both slots, tearing down client %s", host.id, clientAddr)
 
 	host.match.onClientGone(clientAddr)
-	// Close triggers backendToClient's own read-error cleanup path - the
-	// same teardown every other departure already goes through.
-	sess.backendConn.Close()
+	// discoveryProxy sessions: Close triggers backendToClient's own
+	// read-error cleanup path, the same teardown every other departure
+	// already goes through. sessionProxy sessions have no backendConn
+	// (see session.backendAddr's own doc comment) and tear down directly.
+	if sess.backendConn != nil {
+		sess.backendConn.Close()
+	} else {
+		p.doCloseSession(clientAddr.String(), sess)
+	}
 	// Without this, the kicked client's next reconnect would hit
 	// assignForClient's own sticky cache and land right back on this same
 	// host - see clearAssignment's own doc comment for the live bug this
@@ -4221,7 +4453,8 @@ func main() {
 		selectHost:         pool.assignForClient,
 		onClientPacket:     tracker.set,
 		rewriteToClient: func(payload []byte, cfg config, sess *session) []byte {
-			out := discoveryRewrite(payload, cfg)
+			// publicIP: this address is for a REAL CLIENT's benefit.
+			out := discoveryRewrite(payload, cfg, cfg.publicIP)
 			if cfg.verbose && len(out) > 0 {
 				_, rewritten := discoveryAddressOffsets[out[0]]
 				log.Printf("[discovery] reply type 0x%02x (%d bytes) -> client, rewritten=%v (address -> %s:%d)",
@@ -4232,7 +4465,10 @@ func main() {
 			return out
 		},
 		rewriteToBackend: func(payload []byte, cfg config, sess *session) []byte {
-			out := discoveryRewrite(payload, cfg)
+			// internalIP, not publicIP: this address is for the BACKEND's
+			// benefit (see discoveryRewrite's own doc comment and
+			// internalIP's doc comment on config).
+			out := discoveryRewrite(payload, cfg, cfg.internalIP)
 			if cfg.verbose && len(payload) > 0 && payload[0] != 0x25 {
 				// Anything other than the well-known 9-byte enumerate-hosts
 				// query is unexpected - log it in full. 0x20 (client ping)
@@ -4298,30 +4534,50 @@ func main() {
 				// that a genuine pre-match lobby-leave does NOT produce
 				// silence either (the connection keeps chattering normally
 				// afterward), so silence can't be the distinguishing
-				// feature here. What actually separates them: the known
-				// false positive was only ever observed *during* active
-				// gameplay (killing matches "about 2 minutes in"), never
-				// before match-start. A burst before hasStarted() is
-				// confident enough to act on immediately - the in-match
-				// case stays exactly as cautious as it's always been
-				// (logged only) until that's solved separately.
-				if sess.host != nil && sess.host.match != nil && !sess.host.match.hasStarted() {
+				// feature here.
+				//
+				// Correction (2026-08-25): "never before match-start" was
+				// wrong too - live-caught on AKS chasing the NAT source-
+				// port bug (see clientSessionPort's doc comment): a client
+				// STILL MID-HANDSHAKE (never even got a handshake ack, let
+				// alone landed in the lobby) hit this exact periodic
+				// ~2-minute false positive and got its still-recovering
+				// session torn down by this code, which read "match hasn't
+				// started" as "genuine pre-match resign." !hasStarted() on
+				// its own doesn't distinguish "player genuinely in the
+				// lobby, then left" from "connection never got past the
+				// handshake at all" - only the former is a real resign.
+				// Now additionally requires connIDKnown (the same "genuinely
+				// landed in the lobby" signal sendWelcomeMessage's own doc
+				// comment already established, set on this session's first
+				// backend-attributed 0x03 packet) - a burst arriving before
+				// that point is definitely not a real player resigning from
+				// a lobby they were never confirmed to have reached.
+				sess.mu.Lock()
+				landedInLobby := sess.connIDKnown
+				sess.mu.Unlock()
+				if sess.host != nil && sess.host.match != nil && !sess.host.match.hasStarted() && landedInLobby {
 					sess.mu.Lock()
 					alreadyActed := sess.resignCheckPending
 					sess.resignCheckPending = true
 					sess.mu.Unlock()
 					if !alreadyActed {
 						log.Printf("[session] client %s resign-shaped burst seen pre-match, tearing down in %s (letting the burst itself drain first)", sess.clientAddr, resignBurstDrain)
-						clientAddr, host, backendConn := sess.clientAddr, sess.host, sess.backendConn
+						clientAddr, host, key := sess.clientAddr, sess.host, sess.clientAddr.String()
+						sessCopy := sess
 						time.AfterFunc(resignBurstDrain, func() {
 							host.match.onClientGone(clientAddr)
-							// Triggers backendToClient's own read-error
-							// cleanup path - the same teardown every other
-							// departure already goes through
-							// (session-cleanup-design.md), not a new one.
-							backendConn.Close()
+							// This closure runs inside sessionProxy's own
+							// rewriteToBackend (this whole branch only ever
+							// sees sessionProxy sessions), so sessCopy always
+							// has backendAddr set, never backendConn - direct
+							// teardown, no read-error path to trigger (see
+							// session.backendAddr's own doc comment).
+							sessionProxy.doCloseSession(key, sessCopy)
 						})
 					}
+				} else if !landedInLobby {
+					log.Printf("[session] client %s resign-shaped burst seen before landing in lobby (not acted on - not a real resign, see clientSessionPort's doc comment)", sess.clientAddr)
 				} else {
 					log.Printf("[session] client %s resign-shaped burst seen in-match (not acted on, see resign-burst-design.md)", sess.clientAddr)
 				}
@@ -4350,11 +4606,15 @@ func main() {
 			sess.mu.Unlock()
 			var backendIP [4]byte
 			copy(backendIP[:], sess.host.sessionBackendUDPAddr.IP.To4())
-			out := rewriteSessionField(payload, sessionSelfOffset, cfg.publicIP, cfg.publicPort)
+			// internalIP, not publicIP: this is what the BACKEND will
+			// address its own reply to - see internalIP's own doc
+			// comment for why that has to be a directly pod-routable
+			// address, not the (possibly Service-fronted) public one.
+			out := rewriteSessionField(payload, sessionSelfOffset, cfg.internalIP, cfg.publicPort)
 			out = rewriteSessionField(out, sessionPeerOffset, backendIP, uint16(sess.host.sessionBackendUDPAddr.Port))
 			if cfg.verbose {
 				log.Printf("[session] rewriting client-self to %s:%d, peer to backend %s",
-					net.IP(cfg.publicIP[:]), cfg.publicPort, sess.host.sessionBackendUDPAddr)
+					net.IP(cfg.internalIP[:]), cfg.publicPort, sess.host.sessionBackendUDPAddr)
 				log.Printf("[session] client->backend raw: %s", hex.EncodeToString(payload))
 				log.Printf("[session] client->backend sent: %s", hex.EncodeToString(out))
 			}
@@ -4461,10 +4721,18 @@ func main() {
 			var clientIP [4]byte
 			copy(clientIP[:], sess.clientAddr.IP.To4())
 			out := rewriteSessionField(payload, sessionSelfOffset, cfg.publicIP, cfg.publicPort)
-			out = rewriteSessionField(out, sessionPeerOffset, clientIP, uint16(sess.clientAddr.Port))
+			// clientSessionPort (2300), not sess.clientAddr.Port - see
+			// that constant's own doc comment. The literal observed
+			// source port can be NAT-remapped away from 2300 between the
+			// client and aom-lobby; the client validates this field
+			// against its own fixed local self-belief (always 2300), not
+			// against whatever a NAT happened to produce on the wire.
+			// Real return-routing is unaffected - it already targets
+			// sess.clientAddr, the genuine observed address.
+			out = rewriteSessionField(out, sessionPeerOffset, clientIP, clientSessionPort)
 			if cfg.verbose {
-				log.Printf("[session] rewriting host-self to %s:%d, peer to client %s",
-					net.IP(cfg.publicIP[:]), cfg.publicPort, sess.clientAddr)
+				log.Printf("[session] rewriting host-self to %s:%d, peer to client %s (payload port forced to %d)",
+					net.IP(cfg.publicIP[:]), cfg.publicPort, sess.clientAddr, clientSessionPort)
 				log.Printf("[session] backend->client raw: %s", hex.EncodeToString(payload))
 				log.Printf("[session] backend->client sent: %s", hex.EncodeToString(out))
 			}

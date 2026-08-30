@@ -13,5 +13,12 @@ RUN CGO_ENABLED=0 go build -o /host-health-agent .
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /host-health-agent /usr/local/bin/host-health-agent
+# Non-root - port 8090 is >1024, so no CAP_NET_BIND_SERVICE needed; the
+# discovery-port probe this agent makes is an outbound UDP client
+# connection, not a privileged operation either. Also lets
+# k8s/aks/host-health-agent-daemonset.yaml's securityContext
+# (runAsNonRoot: true) actually hold.
+RUN adduser -D -H healthagent
+USER healthagent
 EXPOSE 8090
 ENTRYPOINT ["/usr/local/bin/host-health-agent"]
