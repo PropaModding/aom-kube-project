@@ -1,0 +1,109 @@
+# AKS variant of k8s/aom-headless-deployment.yaml - see that file's own
+# header comment for the full "no /dev/dri, no host X11" rationale,
+# which is unchanged here. Differences from the minikube version, all
+# deliberate:
+#   - image pulled from ACR (aomkubeacr.azurecr.io/aom-k8s:latest,
+#     dockerfile.k8s.aks build - no VNC) instead of loaded straight into
+#     minikube's own daemon.
+#   - No ENABLE_VNC env var, no vnc containerPort - see
+#     dockerfile.k8s.aks's own header comment for why VNC is dropped on
+#     this path specifically (x11vnc runs with -nopw, no password at
+#     all, unacceptable once reachable from a real cloud cluster rather
+#     than only local kubectl port-forward).
+#   - securityContext added: non-root enforcement, dropped Linux
+#     capabilities, no privilege escalation - backstop on top of the
+#     Dockerfile's own USER aomuser, not a replacement for it.
+#
+# Everything else (probe config, resources, downward-API env vars,
+# args) is unchanged - already portable as-is, see the migration plan's
+# "Validated technical findings" section.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aom-headless
+  labels:
+    app: aom-headless
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: aom-headless
+  template:
+    metadata:
+      labels:
+        app: aom-headless
+    spec:
+      # No hostNetwork here, same as the minikube version - aom-lobby
+      # discovers this pod's normal cluster IP via the Kubernetes API,
+      # not a Service (see k8s/aom-headless-deployment.yaml's own
+      # comment for why a shared ClusterIP Service is actively wrong
+      # once there's more than one replica).
+      containers:
+        - name: aom
+          image: aomkubeacr.azurecr.io/aom-k8s:latest
+          imagePullPolicy: Always  # :latest tag reused on every rebuild during active iteration - IfNotPresent silently served a stale cached image (found live 2026-08-25), Always guarantees the node re-checks the digest
+          # No `command:` here deliberately: setting it would replace the
+          # image's ENTRYPOINT (tini -- entrypoint.sh, which starts Xvfb)
+          # rather than just its CMD, and wine would launch with no X
+          # server to talk to. `args` alone overrides CMD only.
+          args: ["wine", "aomxnocd1.exe", "xres=800", "yres=600", "NoIntroCinematics", "window"]
+          securityContext:
+            runAsNonRoot: true
+            # Required alongside runAsNonRoot: dockerfile.k8s(.aks)'s
+            # USER directive uses a name (aomuser), not a numeric UID,
+            # and kubelet can't verify "is this non-root" from a name
+            # alone - confirmed live 2026-08-25
+            # (CreateContainerConfigError: "container has runAsNonRoot
+            # and image has non-numeric user"), same bug as the other
+            # two AKS manifests. 1000 confirmed via `docker run
+            # --entrypoint id`.
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            # Both needed by healthcheck.sh (this Deployment's own
+            # livenessProbe.exec target, see docs/host-health-probe-design.md)
+            # to ask the right node-local host-health-agent about the
+            # right pod - neither is known until the pod is actually
+            # scheduled, hence the downward API rather than a literal
+            # value.
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: NODE_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.hostIP
+            # Same channel set as the minikube version - see that file's
+            # own comment for why (+relay saturated the pod under real
+            # two-client load, reverted to this lighter set).
+            - name: WINEDEBUG
+              value: "+timestamp,+dpwsockx,+dplay,+dplaysvc,+dpnet,+winsock,+ws2_32"
+          ports:
+            - name: dp8-discovery
+              containerPort: 2299
+              protocol: UDP
+            - name: dp8-session
+              containerPort: 2300
+              protocol: UDP
+            - name: input-agent
+              containerPort: 8082
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "2Gi"
+          # Same reasoning/tuning as the minikube version - see that
+          # file's own comment for the full explanation of
+          # initialDelaySeconds/failureThreshold.
+          livenessProbe:
+            exec:
+              command: ["/usr/local/bin/healthcheck.sh"]
+            initialDelaySeconds: 100
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3

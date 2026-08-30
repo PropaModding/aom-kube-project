@@ -1,0 +1,100 @@
+# AKS variant of k8s/lobby-deployment.yaml - the real rework, not a
+# mechanical port. See that file's own header comment for what's
+# unchanged (relay/rewrite logic, dynamic pod discovery via podLister,
+# the status endpoint).
+#
+# hostNetwork removed: on minikube this was needed because AoM's
+# Direct-IP field has no port entry, so 2299/2300 had to be fixed,
+# unmapped node ports. On AKS, k8s/aks/lobby-service.yaml's
+# LoadBalancer Service provides the same fixed, unmapped external ports
+# without needing this pod to sit in a node's own network namespace -
+# strictly better, since it also means this pod schedules like a normal
+# pod (no longer limited to whichever single node can bind the ports).
+#
+# strategy: Recreate is KEPT despite hostNetwork's removal, for a
+# DIFFERENT reason than before: aom-lobby is an in-memory stateful
+# singleton (sessions, hostPool, podLister's own cache all live in one
+# process; replicas must stay 1 by design). If this silently reverted
+# to the default RollingUpdate, a redeploy would briefly run two
+# independent lobby instances behind the same Service, each with its
+# own session state - the LoadBalancer could split a single client's
+# packets across both, which is worse than this strategy's brief
+# downtime gap. Do not remove this thinking it's leftover hostNetwork
+# residue.
+#
+# PUBLIC_ADDR stays a patched placeholder, same idiom as the minikube
+# version, but patched by deploy-aks.sh against the Terraform-managed
+# static public IP - only actually changes anything on the very first
+# deploy (the IP is stable across redeploys), unlike minikube's
+# `minikube ip`, which can differ run to run.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: aom-lobby
+  labels:
+    app: aom-lobby
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: aom-lobby
+  template:
+    metadata:
+      labels:
+        app: aom-lobby
+    spec:
+      serviceAccountName: aom-lobby
+      containers:
+        - name: aom-lobby
+          image: aomkubeacr.azurecr.io/aom-lobby:latest
+          imagePullPolicy: Always  # :latest tag reused on every rebuild during active iteration - IfNotPresent silently served a stale cached image (found live 2026-08-25), Always guarantees the node re-checks the digest
+          securityContext:
+            runAsNonRoot: true
+            # Required alongside runAsNonRoot: dockerfile.lobby's USER
+            # directive uses a name (aomlobby), not a numeric UID, and
+            # kubelet can't verify "is this non-root" from a name alone -
+            # confirmed live 2026-08-25 (CreateContainerConfigError:
+            # "container has runAsNonRoot and image has non-numeric
+            # user"), same bug as host-health-agent-daemonset.yaml. 1000
+            # confirmed via `docker run --entrypoint id`.
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: dp8-discovery
+              containerPort: 2299
+              protocol: UDP
+            - name: dp8-session
+              containerPort: 2300
+              protocol: UDP
+            - name: status-http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            - name: LISTEN_ADDR
+              value: ":2299"
+            - name: SESSION_LISTEN_ADDR
+              value: ":2300"
+            - name: PUBLIC_ADDR
+              value: "127.0.0.1" # placeholder, patched to the static public IP by deploy-aks.sh
+            # Real, directly pod-routable address - used for backend-facing
+            # rewrites instead of PUBLIC_ADDR (see lobby/main.go's
+            # config.internalIP doc comment for the live bug this fixes:
+            # PUBLIC_ADDR is the LoadBalancer's external VIP here, not
+            # reliably reachable by an aom-headless pod on a different
+            # node). Not set at all on the minikube path - hostNetwork
+            # means PUBLIC_ADDR already is the pod's real address there.
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "32Mi"
+            limits:
+              cpu: "200m"
+              memory: "64Mi"

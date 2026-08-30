@@ -12,5 +12,11 @@ RUN CGO_ENABLED=0 go build -o /aom-lobby .
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates
 COPY --from=builder /aom-lobby /usr/local/bin/aom-lobby
+# Non-root - all three listen ports (2299/2300/8080) are >1024, so no
+# CAP_NET_BIND_SERVICE needed. Also lets k8s/aks/lobby-deployment.yaml's
+# securityContext (runAsNonRoot: true) actually hold - alpine's default
+# user is root, which would otherwise fail that check at pod start.
+RUN adduser -D -H aomlobby
+USER aomlobby
 EXPOSE 2299/udp
 ENTRYPOINT ["/usr/local/bin/aom-lobby"]

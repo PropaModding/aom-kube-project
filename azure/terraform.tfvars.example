@@ -1,0 +1,32 @@
+# Copy this file to terraform.tfvars (gitignored - see .gitignore's
+# "azure/**/*.tfvars" rule) and fill in real values. terraform.tfvars is
+# never committed; this .example file is, as the template.
+
+region               = "australiaeast"
+resource_group_name  = "aom-kube-test-rg"
+cluster_name         = "aom-kube-aks"
+
+# Must be globally unique across ALL of Azure (like an S3 bucket name),
+# alphanumeric only, no hyphens. If `terraform apply` fails with a name
+# conflict, pick something more distinctive.
+acr_name = "aomkubeacr"
+
+node_count   = 2
+node_vm_size = "Standard_D4s_v5"
+aks_sku_tier = "Free"
+
+network_policy = "azure"
+
+# Find your own current public IP with:
+#   curl ifconfig.me
+#   curl api.ipify.org
+# Restricts kubectl/API-server access to just this address. Update and
+# re-run `terraform apply` if it changes (see README.md's "my IP
+# changed" runbook) - most home/mobile ISP IPs are dynamic.
+api_server_authorized_ip_ranges = ["YOUR_PUBLIC_IP/32"]
+
+# Notification threshold, not a hard spend cap - Azure budgets can't
+# stop spend on their own. 2x Standard_D4s_v5 running 24/7 costs real
+# money; pair this with the az aks stop/start habit in README.md.
+monthly_budget_aud = 100
+budget_alert_email = "you@example.com"

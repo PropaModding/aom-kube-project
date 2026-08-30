@@ -4,6 +4,32 @@ lobby/aom-lobby
 archiving/sessions/
 pastings
 
+# Azure migration - credentials, local CLI state, and any generated
+# infra-as-code output never belong in the repo (see azure/ once it
+# exists - ARM/Bicep *source* templates we hand-author are fine to
+# commit, this is about generated/secret output only).
+.azure/
+azure/**/*.parameters.local.json
+azure/**/.terraform/
+azure/**/terraform.tfstate
+azure/**/terraform.tfstate.backup
+azure/**/*.tfvars
+!azure/**/*.tfvars.example
+# terraform plan output - a saved `terraform plan -out=...` file embeds
+# the full resulting resource state (real IPs, resource IDs, etc.),
+# same sensitivity class as tfstate above and just as prone to going
+# stale - never meant to be committed, caught live 2026-08-30 not being
+# covered by the tfstate rule above (it's a custom-named plan file, not
+# named terraform.tfstate) right before it would have leaked a real
+# public IP address into the repo.
+azure/**/tfplan
+azure/**/*.tfplan
+*.pfx
+*.publishsettings
+kubeconfig
+kubeconfig.*
+*.kubeconfig
+
 
 
 

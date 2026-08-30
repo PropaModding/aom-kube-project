@@ -1,0 +1,73 @@
+# New resource type, no minikube equivalent - see
+# k8s/aks/lobby-deployment.yaml's own header comment for why this
+# replaces hostNetwork entirely on the AKS path.
+#
+# externalTrafficPolicy: Local is load-bearing, not a nice-to-have -
+# lobby/main.go's session tracking keys everything off the UDP packet's
+# real socket-level source address (p.clientConn.ReadFromUDP). Azure's
+# default Cluster traffic policy SNATs inbound traffic before it reaches
+# the pod, which would collapse every real client onto the same handful
+# of fake source addresses and corrupt session routing. Confirmed
+# against the code before writing this, not assumed.
+#
+# loadBalancerSourceRanges restricts inbound game traffic to just the
+# user's own current public IP - fine while it's solo testing, MUST be
+# widened (or removed) before anyone else needs to connect. Update it
+# and the azure/variables.tf api_server_authorized_ip_ranges together if
+# this IP ever changes - see azure/README.md's "my IP changed" runbook.
+#
+# The azure-pip-name/azure-load-balancer-resource-group annotations
+# pair reference the static public IP azure/main.tf creates in the main
+# resource group (not AKS's own auto-generated node resource group) -
+# confirmed current as of Microsoft's own AKS static-IP docs (updated
+# 2026-07-03): this is the officially documented pattern for a
+# cross-resource-group static IP, which is exactly why
+# azurerm_role_assignment.aks_network_contributor exists in
+# azure/main.tf (grants the AKS cluster's own identity permission to
+# attach it). loadBalancerIP is deliberately NOT used - deprecated
+# upstream in favor of these annotations.
+#
+# Idle-timeout: not set here. Azure LB's default flow idle timeout is a
+# few minutes, which may or may not be long enough for a quiet
+# DirectPlay8 session - confirmed empirically in the migration plan's
+# Phase 5, not guessed at here. If long-quiet sessions turn out to drop,
+# add service.beta.kubernetes.io/azure-load-balancer-tcp-idle-timeout
+# (verify the exact annotation name/whether a UDP-specific one exists
+# at that point, don't just copy this guess back in).
+apiVersion: v1
+kind: Service
+metadata:
+  name: aom-lobby
+  labels:
+    app: aom-lobby
+  annotations:
+    service.beta.kubernetes.io/azure-load-balancer-resource-group: aom-kube-test-rg
+    service.beta.kubernetes.io/azure-pip-name: aom-kube-aks-lobby-pip
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  selector:
+    app: aom-lobby
+  # Restricts inbound game traffic to just this one address - fine while
+  # it's solo testing, must be widened (or this whole field removed)
+  # before anyone else needs to connect. YOUR_PUBLIC_IP_PLACEHOLDER is
+  # deliberately not a real value here (this manifest is committed,
+  # unlike terraform.tfvars) - substitute your own current public IP
+  # (curl ifconfig.me / curl api.ipify.org) before applying, and update
+  # it again whenever it changes (see azure/README.md's "my IP changed"
+  # runbook) since almost no home connection has a static IP.
+  loadBalancerSourceRanges:
+    - YOUR_PUBLIC_IP_PLACEHOLDER/32
+  ports:
+    - name: dp8-discovery
+      port: 2299
+      targetPort: 2299
+      protocol: UDP
+    - name: dp8-session
+      port: 2300
+      targetPort: 2300
+      protocol: UDP
+    # 8080 (status endpoint) deliberately NOT exposed here - stays
+    # internal-only (kubectl port-forward svc/aom-lobby 8080:8080),
+    # matching how VNC access already works. No external consumer for
+    # it today.
